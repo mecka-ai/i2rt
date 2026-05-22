@@ -42,6 +42,7 @@ _CAMERA_MOUNT_OFFSET = np.array([0.0, 0.0, 0.08])
 _RIGHT_CAMERA_SIZE = (1920.0, 1200.0)
 _RIGHT_CAMERA_CROP = np.s_[:1200, 2080:4000]
 _DEFAULT_FRUSTUM_SCALE = 0.12
+_SAFE_TORQUE_LIMIT_NM = 2.0
 
 
 def _browser_visible_url(url: Optional[str]) -> Optional[str]:
@@ -273,18 +274,11 @@ class ViserControlInterface:
         return False
 
     def _enter_vis_grav_comp(self) -> None:
-        """Restore grav-comp on returning to VIS — sim resumes physics, real
-        clears any lingering PD command."""
-        if hasattr(self._robot, "enable_gravity_comp"):
-            self._robot.enable_gravity_comp()
-        elif hasattr(self._robot, "enter_gravity_comp_idle"):
-            self._robot.enter_gravity_comp_idle()
+        """Restore grav-comp on returning to VIS."""
+        self._robot.enter_gravity_comp_idle()
 
     def _enter_control_grav_comp(self) -> None:
-        """Pause sim grav-comp so CONTROL mode can teleport. On real, the next
-        ``command_joint_pos`` implicitly switches to PD — no call needed here."""
-        if hasattr(self._robot, "disable_gravity_comp"):
-            self._robot.disable_gravity_comp()
+        """CONTROL mode switches to PD on the next command."""
         self._in_collision = False
 
     @staticmethod
@@ -543,6 +537,15 @@ class ViserControlInterface:
             enable_btn = server.gui.add_button("Enable Robot")
             enable_btn.disabled = True
             status_md = server.gui.add_markdown("**Status:** DISABLED (read-only)")
+            torque_limit_slider = server.gui.add_slider(
+                "Torque limit (Nm)",
+                min=0.0,
+                max=_SAFE_TORQUE_LIMIT_NM,
+                step=0.05,
+                initial_value=float(
+                    np.clip(info["clip_motor_torque"], 0.0, _SAFE_TORQUE_LIMIT_NM)
+                ),
+            )
 
         # ---- GUI — camera feed -----------------------------------------------
         if self._camera_browser_url is not None or self._camera_mount_frame is not None:
@@ -689,11 +692,15 @@ class ViserControlInterface:
             def _(_: object) -> None:
                 new_kp = np.array([s.value for s in kp_sliders])
                 new_kd = np.array([s.value for s in kd_sliders])
-                if hasattr(self._robot, "update_kp_kd"):
-                    self._robot.update_kp_kd(new_kp, new_kd)
+                self._robot.update_kp_kd(new_kp, new_kd)
                 self._kp = new_kp
                 self._kd = new_kd
                 print(f"[viser] Gains applied: kp={new_kp.tolist()}, kd={new_kd.tolist()}")
+
+        @torque_limit_slider.on_update
+        def _(_: object) -> None:
+            limit = float(torque_limit_slider.value)
+            self._robot.update_clip_motor_torque(limit)
 
         # ---- Main loop -------------------------------------------------------
         prev_controlled = False

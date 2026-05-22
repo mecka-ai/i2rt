@@ -303,6 +303,7 @@ class MotorChainRobot(Robot):
             "gripper_limits": self._gripper_limits,
             "gravity_comp_factor": self.gravity_comp_factor,
             "gripper_index": self._gripper_index,
+            "clip_motor_torque": self._clip_motor_torque,
         }
         if self._gripper_index is not None:
             info["limit_gripper_effort"] = self._limit_gripper_force
@@ -625,6 +626,10 @@ class MotorChainRobot(Robot):
         assert kp.shape == self._kp.shape == kd.shape
         self._kp = kp
         self._kd = kd
+
+    def update_clip_motor_torque(self, clip_motor_torque: float) -> None:
+        assert clip_motor_torque >= 0.0
+        self._clip_motor_torque = clip_motor_torque
 
     def enter_gravity_comp_idle(self) -> None:
         """Reset active commands to gravity-comp idle.
