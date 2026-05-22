@@ -36,6 +36,7 @@ if __name__ == "__main__":
     parser.add_argument("--camera-stream-url", type=str, default=None, help="optional MJPEG stream for camera preview")
     parser.add_argument("--camera-calibration", type=str, default=None, help="hand_eye .npz/.json to visualize")
     parser.add_argument("--camera-mount-frame", type=str, default="link3", help="MuJoCo body used for camera mount")
+    parser.add_argument("--clip-motor-torque", type=float, default=2.0, help="max absolute motor torque in Nm")
     args = parser.parse_args()
 
     arm = ArmType.from_string_name(args.arm)
@@ -53,6 +54,7 @@ if __name__ == "__main__":
         arm_type=arm,
         gripper_type=gripper,
         sim=args.sim,
+        clip_motor_torque=args.clip_motor_torque,
     )
 
     iface = ViserControlInterface.from_robot(

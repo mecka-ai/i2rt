@@ -137,6 +137,7 @@ def get_yam_robot(
     gripper_limits_override: Optional[np.ndarray] = None,
     gripper_kp: Optional[float] = None,
     gripper_kd: Optional[float] = None,
+    clip_motor_torque: float = np.inf,
     sim: bool = False,
     joint_state_saver_factory: Optional[Callable[[], Any]] = None,
     set_realtime_and_pin_callback: Optional[Callable[[int], None]] = None,
@@ -276,6 +277,7 @@ def get_yam_robot(
         grav_comp_kd=grav_comp_kd,
         coulomb_friction=coulomb_friction,
         zero_gravity_mode=zero_gravity_mode,
+        clip_motor_torque=clip_motor_torque,
         joint_state_saver_factory=joint_state_saver_factory,
         set_realtime_and_pin_callback=set_realtime_and_pin_callback,
     )
