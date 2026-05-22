@@ -48,11 +48,13 @@ class ViserControlInterface:
         ee_site: str = "grasp_site",
         dt: float = 0.02,
         port: int = 8080,
+        camera_stream_url: Optional[str] = None,
     ) -> None:
         self._robot = robot
         self._ee_site = ee_site
         self._dt = dt
         self._port = port
+        self._camera_stream_url = camera_stream_url
 
         self._model = mujoco.MjModel.from_xml_path(xml_path)
         self._data = mujoco.MjData(self._model)
@@ -91,8 +93,9 @@ class ViserControlInterface:
         ee_site: str = "grasp_site",
         dt: float = 0.02,
         port: int = 8080,
+        camera_stream_url: Optional[str] = None,
     ) -> "ViserControlInterface":
-        return cls(robot, robot.xml_path, ee_site, dt, port)
+        return cls(robot, robot.xml_path, ee_site, dt, port, camera_stream_url=camera_stream_url)
 
     # ---- MuJoCo helpers -------------------------------------------------------
 
@@ -338,6 +341,13 @@ class ViserControlInterface:
             enable_btn = server.gui.add_button("Enable Robot")
             enable_btn.disabled = True
             status_md = server.gui.add_markdown("**Status:** DISABLED (read-only)")
+
+        # ---- GUI — camera feed -----------------------------------------------
+        if self._camera_stream_url is not None:
+            with server.gui.add_folder("Camera"):
+                server.gui.add_html(
+                    f"<img src='{self._camera_stream_url}' style='width:100%;display:block'>"
+                )
 
         # ---- GUI — mode ------------------------------------------------------
         with server.gui.add_folder("Mode"):

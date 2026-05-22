@@ -33,6 +33,7 @@ if __name__ == "__main__":
     parser.add_argument("--dt", type=float, default=0.02, help="Loop timestep (s)")
     parser.add_argument("--port", type=int, default=8080, help="Viser server port")
     parser.add_argument("--site", type=str, default=None, help="EE site name (auto-detected if omitted)")
+    parser.add_argument("--camera-stream-url", type=str, default=None, help="optional MJPEG stream for camera preview")
     args = parser.parse_args()
 
     arm = ArmType.from_string_name(args.arm)
@@ -52,5 +53,11 @@ if __name__ == "__main__":
         sim=args.sim,
     )
 
-    iface = ViserControlInterface.from_robot(robot, ee_site=site, dt=args.dt, port=args.port)
+    iface = ViserControlInterface.from_robot(
+        robot,
+        ee_site=site,
+        dt=args.dt,
+        port=args.port,
+        camera_stream_url=args.camera_stream_url,
+    )
     iface.run()
