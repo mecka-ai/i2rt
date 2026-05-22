@@ -37,6 +37,7 @@ _BTN_RADIUS = 0.022
 # World-vertical offsets (meters along +Z) above the TCP. Index 0 = SYNC (top), 1 = RECORD (bottom).
 _BTN_Z_OFFSETS = [0.10, 0.04]
 _BTN_LABELS = ["SYNC", "RECORD"]
+_RIGHT_CAMERA_SIZE = (1920.0, 1200.0)
 
 
 def _browser_visible_url(url: Optional[str]) -> Optional[str]:
@@ -306,6 +307,30 @@ class ViserControlInterface:
         return T
 
     @staticmethod
+    def _invert_transform(T: np.ndarray) -> np.ndarray:
+        out = np.eye(4)
+        out[:3, :3] = T[:3, :3].T
+        out[:3, 3] = -out[:3, :3] @ T[:3, 3]
+        return out
+
+    @staticmethod
+    def _mount_to_camera_transform(payload: Dict[str, Any], requested_key: str) -> tuple[np.ndarray, str]:
+        """Return T_mount_camera from supported calibration key variants."""
+        key = requested_key if requested_key in payload else None
+        if key is None:
+            for candidate in ("T_mount2cam", "T_cam2mount", "T_gripper2cam", "T_cam2gripper"):
+                if candidate in payload:
+                    key = candidate
+                    break
+        if key is None:
+            raise ValueError("Calibration has no camera/mount transform")
+
+        T = np.asarray(payload[key], dtype=float)
+        if key in ("T_cam2mount", "T_cam2gripper"):
+            T = ViserControlInterface._invert_transform(T)
+        return T, key
+
+    @staticmethod
     def _load_camera_calibration(
         path: Optional[str],
         mount_frame: str,
@@ -314,45 +339,35 @@ class ViserControlInterface:
         if path is None:
             return None
         p = Path(path).expanduser()
-        if transform_key not in ("T_cam2mount", "T_mount2cam", "T_cam2gripper", "T_gripper2cam"):
-            raise ValueError(f"Unknown camera transform key: {transform_key}")
+
+        payload: Dict[str, Any] = {}
+        camera_matrix = None
         if p.suffix == ".npz":
             data = np.load(p)
-            if transform_key in data:
-                t_camera_mount = data[transform_key]
-            elif transform_key == "T_cam2mount" and "T_cam2gripper" in data:
-                t_camera_mount = data["T_cam2gripper"]
-            elif transform_key == "T_mount2cam" and "T_gripper2cam" in data:
-                t_camera_mount = data["T_gripper2cam"]
-            else:
-                raise ValueError(f"{p} has no {transform_key}")
+            payload = {key: data[key] for key in data.files}
             camera_matrix = data["camera_matrix"] if "camera_matrix" in data else None
-            return {
-                "mount_frame": mount_frame,
-                "transform_key": transform_key,
-                "T_camera_mount": t_camera_mount,
-                "camera_matrix": camera_matrix,
-            }
-        payload = json.loads(p.read_text())
-        if transform_key in payload:
-            t_camera_mount = np.asarray(payload[transform_key], dtype=float)
-            mount_frame = payload.get("robot_frame", mount_frame)
-        elif transform_key == "T_cam2mount" and "T_cam2gripper" in payload:
-            t_camera_mount = np.asarray(payload["T_cam2gripper"], dtype=float)
-        elif transform_key == "T_mount2cam" and "T_gripper2cam" in payload:
-            t_camera_mount = np.asarray(payload["T_gripper2cam"], dtype=float)
         else:
-            raise ValueError(f"{p} has no {transform_key}")
+            payload = json.loads(p.read_text())
+            mount_frame = payload.get("robot_frame", mount_frame)
+            sibling_npz = p.with_suffix(".npz")
+            if sibling_npz.exists():
+                data = np.load(sibling_npz)
+                camera_matrix = data["camera_matrix"] if "camera_matrix" in data else None
+
+        T_mount_camera, source_key = ViserControlInterface._mount_to_camera_transform(payload, transform_key)
+        offset_m = float(np.linalg.norm(T_mount_camera[:3, 3]))
+        if offset_m > 0.75:
+            print(f"[viser] Warning: camera calibration offset is {offset_m:.3f} m; check mount frame/transform.")
         return {
             "mount_frame": mount_frame,
-            "transform_key": transform_key,
-            "T_camera_mount": t_camera_mount,
-            "camera_matrix": None,
+            "transform_key": source_key,
+            "T_mount_camera": T_mount_camera,
+            "camera_matrix": camera_matrix,
         }
 
     @staticmethod
     def _camera_fov_aspect(camera_matrix: Optional[np.ndarray]) -> tuple[float, float]:
-        width, height = 1920.0, 1200.0
+        width, height = _RIGHT_CAMERA_SIZE
         if camera_matrix is None:
             return float(np.radians(95.0)), width / height
         fy = float(camera_matrix[1, 1])
@@ -362,7 +377,7 @@ class ViserControlInterface:
         if self._camera_calibration is None:
             return None
         mount_pose = self._body_pose_4x4(self._camera_calibration["mount_frame"])
-        return mount_pose @ self._camera_calibration["T_camera_mount"]
+        return mount_pose @ self._camera_calibration["T_mount_camera"]
 
     def _read_camera_image(self) -> Optional[np.ndarray]:
         if self._camera_frame_reader is None:
