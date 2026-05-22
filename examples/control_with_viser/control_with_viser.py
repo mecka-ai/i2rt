@@ -34,6 +34,8 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8080, help="Viser server port")
     parser.add_argument("--site", type=str, default=None, help="EE site name (auto-detected if omitted)")
     parser.add_argument("--camera-stream-url", type=str, default=None, help="optional MJPEG stream for camera preview")
+    parser.add_argument("--camera-calibration", type=str, default=None, help="hand_eye .npz/.json to visualize")
+    parser.add_argument("--camera-mount-frame", type=str, default="link3", help="MuJoCo body used for camera mount")
     args = parser.parse_args()
 
     arm = ArmType.from_string_name(args.arm)
@@ -59,5 +61,7 @@ if __name__ == "__main__":
         dt=args.dt,
         port=args.port,
         camera_stream_url=args.camera_stream_url,
+        camera_calibration=args.camera_calibration,
+        camera_mount_frame=args.camera_mount_frame,
     )
     iface.run()
