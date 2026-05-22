@@ -34,8 +34,16 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8080, help="Viser server port")
     parser.add_argument("--site", type=str, default=None, help="EE site name (auto-detected if omitted)")
     parser.add_argument("--camera-stream-url", type=str, default=None, help="optional MJPEG stream for camera preview")
+    parser.add_argument("--camera-browser-url", type=str, default=None, help="browser-visible URL for camera preview")
     parser.add_argument("--camera-calibration", type=str, default=None, help="hand_eye .npz/.json to visualize")
     parser.add_argument("--camera-mount-frame", type=str, default="link3", help="MuJoCo body used for camera mount")
+    parser.add_argument(
+        "--camera-transform-key",
+        type=str,
+        default="T_cam2mount",
+        choices=["T_cam2mount", "T_mount2cam", "T_cam2gripper", "T_gripper2cam"],
+        help="hand-eye transform matrix to visualize",
+    )
     parser.add_argument("--clip-motor-torque", type=float, default=2.0, help="max absolute motor torque in Nm")
     args = parser.parse_args()
 
@@ -63,7 +71,9 @@ if __name__ == "__main__":
         dt=args.dt,
         port=args.port,
         camera_stream_url=args.camera_stream_url,
+        camera_browser_url=args.camera_browser_url,
         camera_calibration=args.camera_calibration,
         camera_mount_frame=args.camera_mount_frame,
+        camera_transform_key=args.camera_transform_key,
     )
     iface.run()

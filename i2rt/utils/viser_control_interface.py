@@ -14,8 +14,10 @@ See examples/control_with_viser/ for a runnable entry-point and README.
 """
 
 import json
+import socket
 import threading
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -35,6 +37,20 @@ _BTN_RADIUS = 0.022
 # World-vertical offsets (meters along +Z) above the TCP. Index 0 = SYNC (top), 1 = RECORD (bottom).
 _BTN_Z_OFFSETS = [0.10, 0.04]
 _BTN_LABELS = ["SYNC", "RECORD"]
+
+
+def _browser_visible_url(url: Optional[str]) -> Optional[str]:
+    """Rewrite loopback stream URLs for browsers connected from another host."""
+    if url is None:
+        return None
+    parsed = urllib.parse.urlparse(url)
+    if parsed.hostname not in ("127.0.0.1", "localhost", "::1"):
+        return url
+    hostname = socket.getfqdn() or socket.gethostname()
+    netloc = hostname
+    if parsed.port is not None:
+        netloc = f"{hostname}:{parsed.port}"
+    return urllib.parse.urlunparse(parsed._replace(netloc=netloc))
 
 
 class _MjpegFrameReader:
@@ -104,15 +120,22 @@ class ViserControlInterface:
         dt: float = 0.02,
         port: int = 8080,
         camera_stream_url: Optional[str] = None,
+        camera_browser_url: Optional[str] = None,
         camera_calibration: Optional[str] = None,
         camera_mount_frame: str = "link3",
+        camera_transform_key: str = "T_cam2mount",
     ) -> None:
         self._robot = robot
         self._ee_site = ee_site
         self._dt = dt
         self._port = port
         self._camera_stream_url = camera_stream_url
-        self._camera_calibration = self._load_camera_calibration(camera_calibration, camera_mount_frame)
+        self._camera_browser_url = camera_browser_url or _browser_visible_url(camera_stream_url)
+        self._camera_calibration = self._load_camera_calibration(
+            camera_calibration,
+            camera_mount_frame,
+            camera_transform_key,
+        )
         self._camera_frame_reader = _MjpegFrameReader(camera_stream_url) if camera_stream_url is not None else None
 
         self._model = mujoco.MjModel.from_xml_path(xml_path)
@@ -153,8 +176,10 @@ class ViserControlInterface:
         dt: float = 0.02,
         port: int = 8080,
         camera_stream_url: Optional[str] = None,
+        camera_browser_url: Optional[str] = None,
         camera_calibration: Optional[str] = None,
         camera_mount_frame: str = "link3",
+        camera_transform_key: str = "T_cam2mount",
     ) -> "ViserControlInterface":
         return cls(
             robot,
@@ -163,8 +188,10 @@ class ViserControlInterface:
             dt,
             port,
             camera_stream_url=camera_stream_url,
+            camera_browser_url=camera_browser_url,
             camera_calibration=camera_calibration,
             camera_mount_frame=camera_mount_frame,
+            camera_transform_key=camera_transform_key,
         )
 
     # ---- MuJoCo helpers -------------------------------------------------------
@@ -279,29 +306,49 @@ class ViserControlInterface:
         return T
 
     @staticmethod
-    def _load_camera_calibration(path: Optional[str], mount_frame: str) -> Optional[Dict[str, Any]]:
+    def _load_camera_calibration(
+        path: Optional[str],
+        mount_frame: str,
+        transform_key: str,
+    ) -> Optional[Dict[str, Any]]:
         if path is None:
             return None
         p = Path(path).expanduser()
+        if transform_key not in ("T_cam2mount", "T_mount2cam", "T_cam2gripper", "T_gripper2cam"):
+            raise ValueError(f"Unknown camera transform key: {transform_key}")
         if p.suffix == ".npz":
             data = np.load(p)
-            if "T_cam2mount" in data:
-                t_cam2mount = data["T_cam2mount"]
-            elif "T_cam2gripper" in data:
-                t_cam2mount = data["T_cam2gripper"]
+            if transform_key in data:
+                t_camera_mount = data[transform_key]
+            elif transform_key == "T_cam2mount" and "T_cam2gripper" in data:
+                t_camera_mount = data["T_cam2gripper"]
+            elif transform_key == "T_mount2cam" and "T_gripper2cam" in data:
+                t_camera_mount = data["T_gripper2cam"]
             else:
-                raise ValueError(f"{p} has no T_cam2mount/T_cam2gripper")
+                raise ValueError(f"{p} has no {transform_key}")
             camera_matrix = data["camera_matrix"] if "camera_matrix" in data else None
-            return {"mount_frame": mount_frame, "T_cam2mount": t_cam2mount, "camera_matrix": camera_matrix}
+            return {
+                "mount_frame": mount_frame,
+                "transform_key": transform_key,
+                "T_camera_mount": t_camera_mount,
+                "camera_matrix": camera_matrix,
+            }
         payload = json.loads(p.read_text())
-        if "T_cam2mount" in payload:
-            t_cam2mount = np.asarray(payload["T_cam2mount"], dtype=float)
+        if transform_key in payload:
+            t_camera_mount = np.asarray(payload[transform_key], dtype=float)
             mount_frame = payload.get("robot_frame", mount_frame)
-        elif "T_cam2gripper" in payload:
-            t_cam2mount = np.asarray(payload["T_cam2gripper"], dtype=float)
+        elif transform_key == "T_cam2mount" and "T_cam2gripper" in payload:
+            t_camera_mount = np.asarray(payload["T_cam2gripper"], dtype=float)
+        elif transform_key == "T_mount2cam" and "T_gripper2cam" in payload:
+            t_camera_mount = np.asarray(payload["T_gripper2cam"], dtype=float)
         else:
-            raise ValueError(f"{p} has no T_cam2mount/T_cam2gripper")
-        return {"mount_frame": mount_frame, "T_cam2mount": t_cam2mount, "camera_matrix": None}
+            raise ValueError(f"{p} has no {transform_key}")
+        return {
+            "mount_frame": mount_frame,
+            "transform_key": transform_key,
+            "T_camera_mount": t_camera_mount,
+            "camera_matrix": None,
+        }
 
     @staticmethod
     def _camera_fov_aspect(camera_matrix: Optional[np.ndarray]) -> tuple[float, float]:
@@ -315,7 +362,7 @@ class ViserControlInterface:
         if self._camera_calibration is None:
             return None
         mount_pose = self._body_pose_4x4(self._camera_calibration["mount_frame"])
-        return mount_pose @ self._camera_calibration["T_cam2mount"]
+        return mount_pose @ self._camera_calibration["T_camera_mount"]
 
     def _read_camera_image(self) -> Optional[np.ndarray]:
         if self._camera_frame_reader is None:
@@ -487,16 +534,16 @@ class ViserControlInterface:
             status_md = server.gui.add_markdown("**Status:** DISABLED (read-only)")
 
         # ---- GUI — camera feed -----------------------------------------------
-        if self._camera_stream_url is not None or self._camera_calibration is not None:
+        if self._camera_browser_url is not None or self._camera_calibration is not None:
             with server.gui.add_folder("Camera"):
                 if self._camera_calibration is not None:
                     server.gui.add_markdown(
                         f"**Mount frame:** `{self._camera_calibration['mount_frame']}`  "
-                        "**Scene:** calibrated camera frustum enabled"
+                        f"**Transform:** `{self._camera_calibration['transform_key']}`"
                     )
-                if self._camera_stream_url is not None:
+                if self._camera_browser_url is not None:
                     server.gui.add_html(
-                        f"<img src='{self._camera_stream_url}' style='width:100%;display:block'>"
+                        f"<img src='{self._camera_browser_url}' style='width:100%;display:block'>"
                     )
 
         # ---- GUI — mode ------------------------------------------------------
