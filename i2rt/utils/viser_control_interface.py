@@ -18,7 +18,6 @@ import socket
 import threading
 import time
 import urllib.parse
-import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -37,7 +36,11 @@ _BTN_RADIUS = 0.022
 # World-vertical offsets (meters along +Z) above the TCP. Index 0 = SYNC (top), 1 = RECORD (bottom).
 _BTN_Z_OFFSETS = [0.10, 0.04]
 _BTN_LABELS = ["SYNC", "RECORD"]
+_CAMERA_MOUNT_BODY_ID = 4
+_CAMERA_MOUNT_GEOM_ID = 4
+_CAMERA_MOUNT_OFFSET = np.array([0.0, 0.0, 0.08])
 _RIGHT_CAMERA_SIZE = (1920.0, 1200.0)
+_RIGHT_CAMERA_CROP = np.s_[:1200, 2080:4000]
 
 
 def _browser_visible_url(url: Optional[str]) -> Optional[str]:
@@ -45,6 +48,8 @@ def _browser_visible_url(url: Optional[str]) -> Optional[str]:
     if url is None:
         return None
     parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return None
     if parsed.hostname not in ("127.0.0.1", "localhost", "::1"):
         return url
     hostname = socket.getfqdn() or socket.gethostname()
@@ -54,55 +59,35 @@ def _browser_visible_url(url: Optional[str]) -> Optional[str]:
     return urllib.parse.urlunparse(parsed._replace(netloc=netloc))
 
 
-class _MjpegFrameReader:
-    """Read latest frame from an MJPEG stream without blocking the render loop."""
-
+class _CameraFeed:
     def __init__(self, url: str) -> None:
-        self._url = url
-        self._frame: Optional[np.ndarray] = None
+        import cv2
+
+        self._cv2 = cv2
+        self._cap = cv2.VideoCapture(url)
+        self._image: Optional[np.ndarray] = None
         self._lock = threading.Lock()
-        self._stop = threading.Event()
+        self._stop = False
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def latest(self) -> Optional[np.ndarray]:
+    def image(self) -> Optional[np.ndarray]:
         with self._lock:
-            return None if self._frame is None else self._frame.copy()
+            return None if self._image is None else self._image.copy()
 
     def close(self) -> None:
-        self._stop.set()
+        self._stop = True
         self._thread.join(timeout=1.0)
+        self._cap.release()
 
     def _run(self) -> None:
-        import cv2
-
-        while not self._stop.is_set():
-            buf = b""
-            try:
-                with urllib.request.urlopen(self._url, timeout=5.0) as response:
-                    while not self._stop.is_set():
-                        chunk = response.read(65536)
-                        if not chunk:
-                            break
-                        buf += chunk
-                        if len(buf) > 4_000_000:
-                            buf = buf[-2_000_000:]
-                        start = buf.find(b"\xff\xd8")
-                        end = buf.find(b"\xff\xd9", start + 2) if start >= 0 else -1
-                        if start < 0 or end < 0:
-                            continue
-                        jpg = np.frombuffer(buf[start : end + 2], dtype=np.uint8)
-                        buf = buf[end + 2 :]
-                        frame = cv2.imdecode(jpg, cv2.IMREAD_COLOR)
-                        if frame is None:
-                            continue
-                        h, w = frame.shape[:2]
-                        if w >= 4000 and h >= 1200:
-                            frame = frame[:1200, 2080:4000]
-                        with self._lock:
-                            self._frame = frame[:, :, ::-1]
-            except Exception:
-                time.sleep(1.0)
+        while not self._stop:
+            ok, frame = self._cap.read()
+            if not ok:
+                time.sleep(0.2)
+                continue
+            with self._lock:
+                self._image = self._cv2.cvtColor(frame[_RIGHT_CAMERA_CROP], self._cv2.COLOR_BGR2RGB)
 
 
 class ViserControlInterface:
@@ -123,8 +108,7 @@ class ViserControlInterface:
         camera_stream_url: Optional[str] = None,
         camera_browser_url: Optional[str] = None,
         camera_calibration: Optional[str] = None,
-        camera_mount_frame: str = "link3",
-        camera_transform_key: str = "T_cam2mount",
+        camera_mount_frame: str = "geom_4_top",
     ) -> None:
         self._robot = robot
         self._ee_site = ee_site
@@ -132,12 +116,18 @@ class ViserControlInterface:
         self._port = port
         self._camera_stream_url = camera_stream_url
         self._camera_browser_url = camera_browser_url or _browser_visible_url(camera_stream_url)
+        self._camera_mount_frame = camera_mount_frame
         self._camera_calibration = self._load_camera_calibration(
             camera_calibration,
             camera_mount_frame,
-            camera_transform_key,
         )
-        self._camera_frame_reader = _MjpegFrameReader(camera_stream_url) if camera_stream_url is not None else None
+        if self._camera_calibration is not None:
+            self._camera_mount_frame = self._camera_calibration["mount_frame"]
+        self._camera_feed = (
+            _CameraFeed(camera_stream_url)
+            if camera_stream_url is not None and self._camera_calibration is not None
+            else None
+        )
 
         self._model = mujoco.MjModel.from_xml_path(xml_path)
         self._data = mujoco.MjData(self._model)
@@ -179,8 +169,7 @@ class ViserControlInterface:
         camera_stream_url: Optional[str] = None,
         camera_browser_url: Optional[str] = None,
         camera_calibration: Optional[str] = None,
-        camera_mount_frame: str = "link3",
-        camera_transform_key: str = "T_cam2mount",
+        camera_mount_frame: str = "geom_4_top",
     ) -> "ViserControlInterface":
         return cls(
             robot,
@@ -192,7 +181,6 @@ class ViserControlInterface:
             camera_browser_url=camera_browser_url,
             camera_calibration=camera_calibration,
             camera_mount_frame=camera_mount_frame,
-            camera_transform_key=camera_transform_key,
         )
 
     # ---- MuJoCo helpers -------------------------------------------------------
@@ -296,16 +284,6 @@ class ViserControlInterface:
         T[:3, :3] = site.xmat.reshape(3, 3)
         return T
 
-    def _body_pose_4x4(self, body_name: str) -> np.ndarray:
-        body_id = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_BODY, body_name)
-        if body_id == -1:
-            available = [mujoco.mj_id2name(self._model, mujoco.mjtObj.mjOBJ_BODY, i) for i in range(self._model.nbody)]
-            raise ValueError(f"Body {body_name!r} not found in model. Available: {available}")
-        T = np.eye(4)
-        T[:3, 3] = self._data.xpos[body_id].copy()
-        T[:3, :3] = self._data.xmat[body_id].reshape(3, 3)
-        return T
-
     @staticmethod
     def _invert_transform(T: np.ndarray) -> np.ndarray:
         out = np.eye(4)
@@ -314,27 +292,18 @@ class ViserControlInterface:
         return out
 
     @staticmethod
-    def _mount_to_camera_transform(payload: Dict[str, Any], requested_key: str) -> tuple[np.ndarray, str]:
-        """Return T_mount_camera from supported calibration key variants."""
-        key = requested_key if requested_key in payload else None
-        if key is None:
-            for candidate in ("T_mount2cam", "T_cam2mount", "T_gripper2cam", "T_cam2gripper"):
-                if candidate in payload:
-                    key = candidate
-                    break
-        if key is None:
-            raise ValueError("Calibration has no camera/mount transform")
-
-        T = np.asarray(payload[key], dtype=float)
-        if key in ("T_cam2mount", "T_cam2gripper"):
-            T = ViserControlInterface._invert_transform(T)
-        return T, key
+    def _mount_to_camera_transform(payload: Dict[str, Any]) -> tuple[np.ndarray, str]:
+        """Return camera pose in the MuJoCo mount frame."""
+        if "T_mount_camera" in payload:
+            return np.asarray(payload["T_mount_camera"], dtype=float), "T_mount_camera"
+        if "T_camera_mount" in payload:
+            return ViserControlInterface._invert_transform(np.asarray(payload["T_camera_mount"], dtype=float)), "T_camera_mount"
+        raise ValueError("Calibration must contain T_mount_camera or T_camera_mount")
 
     @staticmethod
     def _load_camera_calibration(
         path: Optional[str],
         mount_frame: str,
-        transform_key: str,
     ) -> Optional[Dict[str, Any]]:
         if path is None:
             return None
@@ -354,13 +323,17 @@ class ViserControlInterface:
                 data = np.load(sibling_npz)
                 camera_matrix = data["camera_matrix"] if "camera_matrix" in data else None
 
-        T_mount_camera, source_key = ViserControlInterface._mount_to_camera_transform(payload, transform_key)
+        T_mount_camera, source_key = ViserControlInterface._mount_to_camera_transform(payload)
         offset_m = float(np.linalg.norm(T_mount_camera[:3, 3]))
+        print(
+            f"[viser] Camera calibration: frame={mount_frame}, source={source_key}, "
+            f"offset={T_mount_camera[:3, 3]}"
+        )
         if offset_m > 0.75:
             print(f"[viser] Warning: camera calibration offset is {offset_m:.3f} m; check mount frame/transform.")
         return {
             "mount_frame": mount_frame,
-            "transform_key": source_key,
+            "source_key": source_key,
             "T_mount_camera": T_mount_camera,
             "camera_matrix": camera_matrix,
         }
@@ -372,17 +345,6 @@ class ViserControlInterface:
             return float(np.radians(95.0)), width / height
         fy = float(camera_matrix[1, 1])
         return float(2.0 * np.arctan(height / (2.0 * fy))), width / height
-
-    def _camera_pose_4x4(self) -> Optional[np.ndarray]:
-        if self._camera_calibration is None:
-            return None
-        mount_pose = self._body_pose_4x4(self._camera_calibration["mount_frame"])
-        return mount_pose @ self._camera_calibration["T_mount_camera"]
-
-    def _read_camera_image(self) -> Optional[np.ndarray]:
-        if self._camera_frame_reader is None:
-            return None
-        return self._camera_frame_reader.latest()
 
     # ---- Mesh extraction ------------------------------------------------------
 
@@ -482,23 +444,28 @@ class ViserControlInterface:
         # ---- Scene objects ----------------------------------------------------
         mesh_handles = self._setup_scene(server)
         ee_frame = server.scene.add_frame("ee_frame", axes_length=0.06, axes_radius=0.004)
+        camera_mount_frame = server.scene.add_frame(
+            "camera_mount_frame",
+            axes_length=0.08,
+            axes_radius=0.003,
+        )
         camera_frame = None
         camera_frustum = None
         if self._camera_calibration is not None:
-            fov, aspect = self._camera_fov_aspect(self._camera_calibration.get("camera_matrix"))
             camera_frame = server.scene.add_frame(
-                "calibrated_camera/frame",
-                axes_length=0.04,
+                "calibrated_camera/opencv_frame",
+                axes_length=0.06,
                 axes_radius=0.002,
             )
+            fov, aspect = self._camera_fov_aspect(self._camera_calibration.get("camera_matrix"))
             camera_frustum = server.scene.add_camera_frustum(
                 "calibrated_camera/frustum",
                 fov=fov,
                 aspect=aspect,
-                scale=0.10,
+                scale=0.12,
                 line_width=2.0,
                 color=(40, 200, 255),
-                image=self._read_camera_image(),
+                image=None if self._camera_feed is None else self._camera_feed.image(),
                 format="jpeg",
                 jpeg_quality=70,
             )
@@ -549,13 +516,11 @@ class ViserControlInterface:
             status_md = server.gui.add_markdown("**Status:** DISABLED (read-only)")
 
         # ---- GUI — camera feed -----------------------------------------------
-        if self._camera_browser_url is not None or self._camera_calibration is not None:
+        if self._camera_browser_url is not None or self._camera_mount_frame is not None:
             with server.gui.add_folder("Camera"):
+                server.gui.add_markdown(f"**Mount frame:** `{self._camera_mount_frame}`")
                 if self._camera_calibration is not None:
-                    server.gui.add_markdown(
-                        f"**Mount frame:** `{self._camera_calibration['mount_frame']}`  "
-                        f"**Transform:** `{self._camera_calibration['transform_key']}`"
-                    )
+                    server.gui.add_markdown(f"**Calibration:** `{self._camera_calibration['source_key']}`")
                 if self._camera_browser_url is not None:
                     server.gui.add_html(
                         f"<img src='{self._camera_browser_url}' style='width:100%;display:block'>"
@@ -702,16 +667,24 @@ class ViserControlInterface:
                 ee_frame.position = T[:3, 3]
                 ee_frame.wxyz = self._mat3_to_wxyz(T[:3, :3])
 
-                if camera_frame is not None and camera_frustum is not None:
-                    T_camera = self._camera_pose_4x4()
-                    if T_camera is not None:
-                        camera_frame.position = T_camera[:3, 3]
-                        camera_frame.wxyz = self._mat3_to_wxyz(T_camera[:3, :3])
+                R_mount = self._data.xmat[_CAMERA_MOUNT_BODY_ID].reshape(3, 3)
+                T_mount = np.eye(4)
+                T_mount[:3, :3] = R_mount
+                T_mount[:3, 3] = self._data.geom_xpos[_CAMERA_MOUNT_GEOM_ID] + _CAMERA_MOUNT_OFFSET
+                camera_mount_frame.position = T_mount[:3, 3]
+                camera_mount_frame.wxyz = self._mat3_to_wxyz(T_mount[:3, :3])
+
+                if camera_frame is not None:
+                    T_camera = T_mount @ self._camera_calibration["T_mount_camera"]
+                    camera_frame.position = T_camera[:3, 3]
+                    camera_frame.wxyz = self._mat3_to_wxyz(T_camera[:3, :3])
+                    if camera_frustum is not None:
                         camera_frustum.position = T_camera[:3, 3]
                         camera_frustum.wxyz = self._mat3_to_wxyz(T_camera[:3, :3])
-                        image = self._read_camera_image()
-                        if image is not None:
-                            camera_frustum.image = image
+                        if self._camera_feed is not None:
+                            image = self._camera_feed.image()
+                            if image is not None:
+                                camera_frustum.image = image
 
                 if self._with_teaching_handle:
                     handle_state = self._get_teaching_handle_state()
@@ -806,6 +779,6 @@ class ViserControlInterface:
         except KeyboardInterrupt:
             pass
 
-        if self._camera_frame_reader is not None:
-            self._camera_frame_reader.close()
+        if self._camera_feed is not None:
+            self._camera_feed.close()
         print("[viser] Stopped")
