@@ -171,6 +171,7 @@ class ViserControlInterface:
         n = robot.num_dofs()
         self._kp: np.ndarray = info.get("kp", np.full(n, 10.0)).copy()
         self._kd: np.ndarray = info.get("kd", np.full(n, 1.0)).copy()
+        self._gain_scale = 1.0
         self._gripper_index: Optional[int] = info.get("gripper_index")
         self._gripper_limits: Optional[np.ndarray] = info.get("gripper_limits")
         self._is_sim: bool = info.get("sim", False)
@@ -279,7 +280,11 @@ class ViserControlInterface:
 
     def _enter_control_grav_comp(self) -> None:
         """CONTROL mode switches to PD on the next command."""
+        self._apply_scaled_gains()
         self._in_collision = False
+
+    def _apply_scaled_gains(self) -> None:
+        self._robot.update_kp_kd(self._kp * self._gain_scale, self._kd * self._gain_scale)
 
     @staticmethod
     def _mat3_to_wxyz(mat3: np.ndarray) -> np.ndarray:
@@ -546,6 +551,13 @@ class ViserControlInterface:
                     np.clip(info["clip_motor_torque"], 0.0, _SAFE_TORQUE_LIMIT_NM)
                 ),
             )
+            gain_scale_slider = server.gui.add_slider(
+                "PD gain scale",
+                min=0.0,
+                max=1.0,
+                step=0.05,
+                initial_value=self._gain_scale,
+            )
 
         # ---- GUI — camera feed -----------------------------------------------
         if self._camera_browser_url is not None or self._camera_mount_frame is not None:
@@ -645,6 +657,7 @@ class ViserControlInterface:
                     s.value = float(np.degrees(q[i]))
             if gripper_slider is not None and self._gripper_index is not None:
                 gripper_slider.value = float(q[self._gripper_index])
+            self._apply_scaled_gains()
 
         @mode_dd.on_update
         def _(_: object) -> None:
@@ -692,15 +705,24 @@ class ViserControlInterface:
             def _(_: object) -> None:
                 new_kp = np.array([s.value for s in kp_sliders])
                 new_kd = np.array([s.value for s in kd_sliders])
-                self._robot.update_kp_kd(new_kp, new_kd)
                 self._kp = new_kp
                 self._kd = new_kd
-                print(f"[viser] Gains applied: kp={new_kp.tolist()}, kd={new_kd.tolist()}")
+                self._apply_scaled_gains()
+                print(
+                    f"[viser] Gains applied: scale={self._gain_scale:.2f}, "
+                    f"kp={(new_kp * self._gain_scale).tolist()}, "
+                    f"kd={(new_kd * self._gain_scale).tolist()}"
+                )
 
         @torque_limit_slider.on_update
         def _(_: object) -> None:
             limit = float(torque_limit_slider.value)
             self._robot.update_clip_motor_torque(limit)
+
+        @gain_scale_slider.on_update
+        def _(_: object) -> None:
+            self._gain_scale = float(gain_scale_slider.value)
+            self._apply_scaled_gains()
 
         # ---- Main loop -------------------------------------------------------
         prev_controlled = False
