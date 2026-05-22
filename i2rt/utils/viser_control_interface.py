@@ -41,6 +41,7 @@ _CAMERA_MOUNT_GEOM_ID = 4
 _CAMERA_MOUNT_OFFSET = np.array([0.0, 0.0, 0.08])
 _RIGHT_CAMERA_SIZE = (1920.0, 1200.0)
 _RIGHT_CAMERA_CROP = np.s_[:1200, 2080:4000]
+_DEFAULT_FRUSTUM_SCALE = 0.12
 
 
 def _browser_visible_url(url: Optional[str]) -> Optional[str]:
@@ -60,11 +61,28 @@ def _browser_visible_url(url: Optional[str]) -> Optional[str]:
 
 
 class _CameraFeed:
-    def __init__(self, url: str) -> None:
+    def __init__(
+        self,
+        url: str,
+        camera_matrix: Optional[np.ndarray],
+        distortion: Optional[np.ndarray],
+    ) -> None:
         import cv2
 
         self._cv2 = cv2
         self._cap = cv2.VideoCapture(url)
+        self._map1 = None
+        self._map2 = None
+        if camera_matrix is not None and distortion is not None and len(distortion.reshape(-1)) == 4:
+            size = tuple(int(v) for v in _RIGHT_CAMERA_SIZE)
+            self._map1, self._map2 = cv2.fisheye.initUndistortRectifyMap(
+                camera_matrix,
+                distortion.reshape(4, 1),
+                np.eye(3),
+                camera_matrix,
+                size,
+                cv2.CV_16SC2,
+            )
         self._image: Optional[np.ndarray] = None
         self._lock = threading.Lock()
         self._stop = False
@@ -86,8 +104,11 @@ class _CameraFeed:
             if not ok:
                 time.sleep(0.2)
                 continue
+            frame = frame[_RIGHT_CAMERA_CROP]
+            if self._map1 is not None and self._map2 is not None:
+                frame = self._cv2.remap(frame, self._map1, self._map2, interpolation=self._cv2.INTER_LINEAR)
             with self._lock:
-                self._image = self._cv2.cvtColor(frame[_RIGHT_CAMERA_CROP], self._cv2.COLOR_BGR2RGB)
+                self._image = self._cv2.cvtColor(frame, self._cv2.COLOR_BGR2RGB)
 
 
 class ViserControlInterface:
@@ -124,7 +145,11 @@ class ViserControlInterface:
         if self._camera_calibration is not None:
             self._camera_mount_frame = self._camera_calibration["mount_frame"]
         self._camera_feed = (
-            _CameraFeed(camera_stream_url)
+            _CameraFeed(
+                camera_stream_url,
+                self._camera_calibration.get("camera_matrix"),
+                self._camera_calibration.get("distortion"),
+            )
             if camera_stream_url is not None and self._camera_calibration is not None
             else None
         )
@@ -311,10 +336,12 @@ class ViserControlInterface:
 
         payload: Dict[str, Any] = {}
         camera_matrix = None
+        distortion = None
         if p.suffix == ".npz":
             data = np.load(p)
             payload = {key: data[key] for key in data.files}
             camera_matrix = data["camera_matrix"] if "camera_matrix" in data else None
+            distortion = data["distortion"] if "distortion" in data else None
         else:
             payload = json.loads(p.read_text())
             mount_frame = payload.get("robot_frame", mount_frame)
@@ -322,6 +349,7 @@ class ViserControlInterface:
             if sibling_npz.exists():
                 data = np.load(sibling_npz)
                 camera_matrix = data["camera_matrix"] if "camera_matrix" in data else None
+                distortion = data["distortion"] if "distortion" in data else None
 
         T_mount_camera, source_key = ViserControlInterface._mount_to_camera_transform(payload)
         offset_m = float(np.linalg.norm(T_mount_camera[:3, 3]))
@@ -336,6 +364,7 @@ class ViserControlInterface:
             "source_key": source_key,
             "T_mount_camera": T_mount_camera,
             "camera_matrix": camera_matrix,
+            "distortion": distortion,
         }
 
     @staticmethod
@@ -462,7 +491,7 @@ class ViserControlInterface:
                 "calibrated_camera/frustum",
                 fov=fov,
                 aspect=aspect,
-                scale=0.12,
+                scale=_DEFAULT_FRUSTUM_SCALE,
                 line_width=2.0,
                 color=(40, 200, 255),
                 image=None if self._camera_feed is None else self._camera_feed.image(),
@@ -521,10 +550,21 @@ class ViserControlInterface:
                 server.gui.add_markdown(f"**Mount frame:** `{self._camera_mount_frame}`")
                 if self._camera_calibration is not None:
                     server.gui.add_markdown(f"**Calibration:** `{self._camera_calibration['source_key']}`")
+                    frustum_scale_slider = server.gui.add_slider(
+                        "Frustum length",
+                        min=0.02,
+                        max=0.50,
+                        step=0.01,
+                        initial_value=_DEFAULT_FRUSTUM_SCALE,
+                    )
+                else:
+                    frustum_scale_slider = None
                 if self._camera_browser_url is not None:
                     server.gui.add_html(
                         f"<img src='{self._camera_browser_url}' style='width:100%;display:block'>"
                     )
+        else:
+            frustum_scale_slider = None
 
         # ---- GUI — mode ------------------------------------------------------
         with server.gui.add_folder("Mode"):
@@ -681,6 +721,8 @@ class ViserControlInterface:
                     if camera_frustum is not None:
                         camera_frustum.position = T_camera[:3, 3]
                         camera_frustum.wxyz = self._mat3_to_wxyz(T_camera[:3, :3])
+                        if frustum_scale_slider is not None:
+                            camera_frustum.scale = frustum_scale_slider.value
                         if self._camera_feed is not None:
                             image = self._camera_feed.image()
                             if image is not None:
