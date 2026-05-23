@@ -47,14 +47,8 @@ Hand-eye calibration outputs are discovered from:
 /home/radxa/artifacts/hand_eye_left/hand_eye.json
 ```
 
-Run right-camera calibration:
+Run both-camera calibration:
 
 ```bash
-ssh -t radxa@atlascm7660 "cd /home/radxa/elevator_detection && .venv/bin/python calibration/capture_hand_eye.py right"
-```
-
-Run left-camera calibration:
-
-```bash
-ssh -t radxa@atlascm7660 "cd /home/radxa/elevator_detection && .venv/bin/python calibration/capture_hand_eye.py left"
+ssh -t radxa@atlascm7660 "cd /home/radxa/elevator_detection && .venv/bin/python calibration/capture_hand_eye.py"
 ```
