@@ -9,6 +9,7 @@ cd /Users/theol/Documents/github/elevator_detection/i2rt
 rsync -av i2rt/utils/nexus_camera.py radxa@atlascm7660:/home/radxa/i2rt/i2rt/utils/nexus_camera.py
 rsync -av i2rt/utils/viser_control_interface.py radxa@atlascm7660:/home/radxa/i2rt/i2rt/utils/viser_control_interface.py
 rsync -av examples/control_with_viser/control_with_viser.py radxa@atlascm7660:/home/radxa/i2rt/examples/control_with_viser/control_with_viser.py
+rsync -av ../calibration/capture_hand_eye.py radxa@atlascm7660:/home/radxa/capture_hand_eye.py
 ```
 
 Run on the CM5:
@@ -39,13 +40,13 @@ Hand-eye calibration outputs are discovered from:
 Run right-camera calibration:
 
 ```bash
-cd /home/radxa/elevator_detection/calibration
+cd /home/radxa
 python capture_hand_eye.py right
 ```
 
 Run left-camera calibration:
 
 ```bash
-cd /home/radxa/elevator_detection/calibration
+cd /home/radxa
 python capture_hand_eye.py left
 ```

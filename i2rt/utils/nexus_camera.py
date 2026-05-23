@@ -7,11 +7,12 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable
 
 import numpy as np
 
-DEFAULT_SOURCE = "/dev/video2"
+DEVICE_INDEX = 2
+DEVICE = f"/dev/video{DEVICE_INDEX}"
 DEFAULT_INTRINSICS_PATH = Path("/home/radxa/camera-backend/calibration.json")
 FRAME_SIZE = (4000, 1200)
 FISHEYE_UNDISTORT_BALANCE = 0.5
@@ -36,10 +37,7 @@ CAMERAS = {
 
 
 def camera_spec(name: str) -> CameraSpec:
-    try:
-        return CAMERAS[name]
-    except KeyError as exc:
-        raise ValueError(f"unknown Nexus2 camera {name!r}; expected one of {sorted(CAMERAS)}") from exc
+    return CAMERAS[name]
 
 
 def hand_eye_output_dir(camera: str) -> Path:
@@ -94,12 +92,6 @@ class FisheyeCameraModel:
     def aspect(self) -> float:
         return float(self.image_size[0] / self.image_size[1])
 
-    def undistort(self, image: np.ndarray) -> np.ndarray:
-        import cv2
-
-        map1, map2 = self.undistort_maps(cv2)
-        return cv2.remap(image, map1, map2, interpolation=cv2.INTER_LINEAR)
-
     def undistort_maps(self, cv2: Any) -> tuple[np.ndarray, np.ndarray]:
         return cv2.fisheye.initUndistortRectifyMap(
             self.camera_matrix,
@@ -120,7 +112,7 @@ def model_from_intrinsics_file(path: Path, camera: str) -> FisheyeCameraModel:
     spec = camera_spec(camera)
     payload = json.loads(path.expanduser().read_text())
     record = payload["value0"]["intrinsics"][spec.index]
-    intrinsics = record["intrinsics"] if "intrinsics" in record else record
+    intrinsics = record["intrinsics"]
     camera_matrix = np.array(
         [
             [intrinsics["fx"], 0.0, intrinsics["cx"]],
@@ -136,55 +128,48 @@ def model_from_intrinsics_file(path: Path, camera: str) -> FisheyeCameraModel:
     return FisheyeCameraModel.from_intrinsics(camera_matrix, distortion, spec.image_size)
 
 
-def model_from_npz(path: Path, camera: str) -> Optional[FisheyeCameraModel]:
+def model_from_npz(path: Path, camera: str) -> FisheyeCameraModel:
     spec = camera_spec(camera)
     data = np.load(path.expanduser())
-    if "camera_matrix" not in data or "distortion" not in data:
-        return None
     return FisheyeCameraModel.from_intrinsics(data["camera_matrix"], data["distortion"], spec.image_size)
 
 
 class NexusCamera:
     def __init__(
         self,
-        source: str = DEFAULT_SOURCE,
-        cameras: Iterable[str] = CAMERAS.keys(),
-        models: Optional[dict[str, FisheyeCameraModel]] = None,
+        cameras: Iterable[str],
+        models: dict[str, FisheyeCameraModel],
         start_thread: bool = False,
     ) -> None:
         import cv2
 
         self._cv2 = cv2
-        self._source = source
         self._cameras = tuple(camera_spec(name).name for name in cameras)
-        self._models = models or {}
         self._maps = {
-            name: self._models[name].undistort_maps(cv2)
+            name: models[name].undistort_maps(cv2)
             for name in self._cameras
-            if name in self._models
         }
-        self._cap = self._open_capture(source)
-        self._latest_full_rgb: Optional[np.ndarray] = None
+        self._cap = self._open_capture()
+        self._latest_full_rgb: np.ndarray | None = None
         self._latest_rgb: dict[str, np.ndarray] = {}
         self._lock = threading.Lock()
         self._stop = False
-        self._thread: Optional[threading.Thread] = None
+        self._thread: threading.Thread | None = None
         if start_thread:
+            _, frame = self.read_full()
+            self._publish_frame(frame)
             self._thread = threading.Thread(target=self._run, daemon=True)
             self._thread.start()
 
-    def _open_capture(self, source: str) -> Any:
-        if source.startswith("/dev/video"):
-            cap = self._cv2.VideoCapture(int(source.removeprefix("/dev/video")), self._cv2.CAP_V4L2)
-            cap.set(self._cv2.CAP_PROP_FOURCC, self._cv2.VideoWriter_fourcc(*"MJPG"))
-            cap.set(self._cv2.CAP_PROP_FRAME_WIDTH, FRAME_SIZE[0])
-            cap.set(self._cv2.CAP_PROP_FRAME_HEIGHT, FRAME_SIZE[1])
-            cap.set(self._cv2.CAP_PROP_FPS, 30)
-            cap.set(self._cv2.CAP_PROP_BUFFERSIZE, 1)
-        else:
-            cap = self._cv2.VideoCapture(source)
+    def _open_capture(self) -> Any:
+        cap = self._cv2.VideoCapture(DEVICE_INDEX, self._cv2.CAP_V4L2)
+        cap.set(self._cv2.CAP_PROP_FOURCC, self._cv2.VideoWriter_fourcc(*"MJPG"))
+        cap.set(self._cv2.CAP_PROP_FRAME_WIDTH, FRAME_SIZE[0])
+        cap.set(self._cv2.CAP_PROP_FRAME_HEIGHT, FRAME_SIZE[1])
+        cap.set(self._cv2.CAP_PROP_FPS, 30)
+        cap.set(self._cv2.CAP_PROP_BUFFERSIZE, 1)
         if not cap.isOpened():
-            raise RuntimeError(f"could not open camera source {source!r}")
+            raise RuntimeError(f"could not open {DEVICE}")
         return cap
 
     def close(self) -> None:
@@ -199,46 +184,35 @@ class NexusCamera:
         for _ in range(max(1, flush_frames)):
             ok, frame = self._cap.read()
         if not ok or frame is None:
-            raise RuntimeError(f"failed to read camera source {self._source!r}")
+            raise RuntimeError(f"failed to read {DEVICE}")
         return time.time(), frame
 
-    def read_camera(self, camera: str, flush_frames: int = 1, undistort: bool = False) -> tuple[float, np.ndarray]:
+    def read_camera(self, camera: str, flush_frames: int = 1) -> tuple[float, np.ndarray]:
         timestamp, frame = self.read_full(flush_frames)
         image = camera_spec(camera).crop(frame)
-        if undistort and camera in self._maps:
-            map1, map2 = self._maps[camera]
-            image = self._cv2.remap(image, map1, map2, interpolation=self._cv2.INTER_LINEAR)
         return timestamp, image
 
-    def latest_full_rgb(self) -> Optional[np.ndarray]:
+    def latest_full_rgb(self) -> np.ndarray:
         with self._lock:
-            return None if self._latest_full_rgb is None else self._latest_full_rgb.copy()
+            assert self._latest_full_rgb is not None
+            return self._latest_full_rgb.copy()
 
-    def latest_rgb(self, camera: str) -> Optional[np.ndarray]:
+    def latest_rgb(self, camera: str) -> np.ndarray:
         with self._lock:
-            image = self._latest_rgb.get(camera)
-            return None if image is None else image.copy()
+            return self._latest_rgb[camera].copy()
 
     def _run(self) -> None:
         while not self._stop:
-            try:
-                _, frame = self.read_full()
-            except RuntimeError:
-                time.sleep(0.2)
-                continue
-            camera_images = {}
-            for name in self._cameras:
-                image = camera_spec(name).crop(frame)
-                if name in self._maps:
-                    map1, map2 = self._maps[name]
-                    image = self._cv2.remap(image, map1, map2, interpolation=self._cv2.INTER_LINEAR)
-                camera_images[name] = self._cv2.cvtColor(image, self._cv2.COLOR_BGR2RGB)
-            with self._lock:
-                self._latest_full_rgb = self._cv2.cvtColor(frame, self._cv2.COLOR_BGR2RGB)
-                self._latest_rgb = camera_images
+            _, frame = self.read_full()
+            self._publish_frame(frame)
 
-    def __enter__(self) -> "NexusCamera":
-        return self
-
-    def __exit__(self, *_: object) -> None:
-        self.close()
+    def _publish_frame(self, frame: np.ndarray) -> None:
+        camera_images = {}
+        for name in self._cameras:
+            image = camera_spec(name).crop(frame)
+            map1, map2 = self._maps[name]
+            image = self._cv2.remap(image, map1, map2, interpolation=self._cv2.INTER_LINEAR)
+            camera_images[name] = self._cv2.cvtColor(image, self._cv2.COLOR_BGR2RGB)
+        with self._lock:
+            self._latest_full_rgb = self._cv2.cvtColor(frame, self._cv2.COLOR_BGR2RGB)
+            self._latest_rgb = camera_images

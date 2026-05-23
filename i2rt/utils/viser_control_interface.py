@@ -14,9 +14,7 @@ See examples/control_with_viser/ for a runnable entry-point and README.
 """
 
 import json
-import socket
 import time
-import urllib.parse
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -47,22 +45,6 @@ _DEFAULT_FRUSTUM_SCALE = 0.12
 _SAFE_TORQUE_LIMIT_NM = 2.0
 
 
-def _browser_visible_url(url: Optional[str]) -> Optional[str]:
-    """Rewrite loopback stream URLs for browsers connected from another host."""
-    if url is None:
-        return None
-    parsed = urllib.parse.urlparse(url)
-    if parsed.scheme not in ("http", "https"):
-        return None
-    if parsed.hostname not in ("127.0.0.1", "localhost", "::1"):
-        return url
-    hostname = socket.getfqdn() or socket.gethostname()
-    netloc = hostname
-    if parsed.port is not None:
-        netloc = f"{hostname}:{parsed.port}"
-    return urllib.parse.urlunparse(parsed._replace(netloc=netloc))
-
-
 class ViserControlInterface:
     """Browser-based robot visualiser and controller with a safety gate.
 
@@ -75,39 +57,23 @@ class ViserControlInterface:
         self,
         robot: Robot,
         xml_path: str,
+        camera_calibrations: Dict[str, str],
         ee_site: str = "grasp_site",
         dt: float = 0.02,
         port: int = 8080,
-        camera_stream_url: Optional[str] = None,
-        camera_browser_url: Optional[str] = None,
-        camera_calibration: Optional[str] = None,
-        camera_calibrations: Optional[Dict[str, str]] = None,
         camera_mount_frame: str = "geom_4_top",
     ) -> None:
         self._robot = robot
         self._ee_site = ee_site
         self._dt = dt
         self._port = port
-        self._camera_stream_url = camera_stream_url
-        self._camera_browser_url = camera_browser_url or _browser_visible_url(camera_stream_url)
         self._camera_mount_frame = camera_mount_frame
-        calibration_paths = camera_calibrations or {}
-        if camera_calibration is not None and "right" not in calibration_paths:
-            calibration_paths = {**calibration_paths, "right": camera_calibration}
-        self._camera_calibrations = self._load_camera_calibrations(calibration_paths, camera_mount_frame)
-        if camera_stream_url is None:
-            self._camera_feed = None
-        else:
-            self._camera_feed = NexusCamera(
-                camera_stream_url,
-                cameras=CAMERAS.keys(),
-                models={
-                    name: calibration["camera_model"]
-                    for name, calibration in self._camera_calibrations.items()
-                    if calibration.get("camera_model") is not None
-                },
-                start_thread=True,
-            )
+        self._camera_calibrations = self._load_camera_calibrations(camera_calibrations, camera_mount_frame)
+        self._camera_feed = NexusCamera(
+            cameras=CAMERAS.keys(),
+            models={name: calibration["camera_model"] for name, calibration in self._camera_calibrations.items()},
+            start_thread=True,
+        )
 
         self._model = mujoco.MjModel.from_xml_path(xml_path)
         self._data = mujoco.MjData(self._model)
@@ -144,25 +110,19 @@ class ViserControlInterface:
     def from_robot(
         cls,
         robot: MotorChainRobot,
+        camera_calibrations: Dict[str, str],
         ee_site: str = "grasp_site",
         dt: float = 0.02,
         port: int = 8080,
-        camera_stream_url: Optional[str] = None,
-        camera_browser_url: Optional[str] = None,
-        camera_calibration: Optional[str] = None,
-        camera_calibrations: Optional[Dict[str, str]] = None,
         camera_mount_frame: str = "geom_4_top",
     ) -> "ViserControlInterface":
         return cls(
             robot,
             robot.xml_path,
+            camera_calibrations,
             ee_site,
             dt,
             port,
-            camera_stream_url=camera_stream_url,
-            camera_browser_url=camera_browser_url,
-            camera_calibration=camera_calibration,
-            camera_calibrations=camera_calibrations,
             camera_mount_frame=camera_mount_frame,
         )
 
@@ -264,74 +224,39 @@ class ViserControlInterface:
         T[:3, :3] = site.xmat.reshape(3, 3)
         return T
 
-    @staticmethod
-    def _invert_transform(T: np.ndarray) -> np.ndarray:
-        out = np.eye(4)
-        out[:3, :3] = T[:3, :3].T
-        out[:3, 3] = -out[:3, :3] @ T[:3, 3]
-        return out
-
-    @staticmethod
-    def _mount_to_camera_transform(payload: Dict[str, Any]) -> tuple[np.ndarray, str]:
-        """Return camera pose in the MuJoCo mount frame."""
-        if "T_mount_camera" in payload:
-            return np.asarray(payload["T_mount_camera"], dtype=float), "T_mount_camera"
-        if "T_camera_mount" in payload:
-            return ViserControlInterface._invert_transform(np.asarray(payload["T_camera_mount"], dtype=float)), "T_camera_mount"
-        raise ValueError("Calibration must contain T_mount_camera or T_camera_mount")
-
     @classmethod
     def _load_camera_calibrations(
         cls,
         paths: Dict[str, str],
         mount_frame: str,
     ) -> Dict[str, Dict[str, Any]]:
-        calibrations = {}
-        for camera, path in paths.items():
-            calibration = cls._load_camera_calibration(camera, path, mount_frame)
-            if calibration is not None:
-                calibrations[camera] = calibration
-        return calibrations
+        return {
+            camera: cls._load_camera_calibration(camera, path, mount_frame)
+            for camera, path in paths.items()
+        }
 
     @staticmethod
     def _load_camera_calibration(
         camera: str,
         path: str,
         mount_frame: str,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Dict[str, Any]:
         p = Path(path).expanduser()
-        if not p.exists():
-            print(f"[viser] Camera calibration missing for {camera}: {p}")
-            return None
 
-        payload: Dict[str, Any] = {}
-        if p.suffix == ".npz":
-            data = np.load(p)
-            payload = {key: data[key] for key in data.files}
-            camera_model = model_from_npz(p, camera)
-        else:
-            payload = json.loads(p.read_text())
-            mount_frame = payload.get("robot_frame", mount_frame)
-            sibling_npz = p.with_suffix(".npz")
-            camera_model = model_from_npz(sibling_npz, camera) if sibling_npz.exists() else None
-
-        T_mount_camera, source_key = ViserControlInterface._mount_to_camera_transform(payload)
-        offset_m = float(np.linalg.norm(T_mount_camera[:3, 3]))
+        payload = json.loads(p.read_text())
+        camera_model = model_from_npz(p.with_suffix(".npz"), camera)
+        T_mount_camera = np.asarray(payload["T_mount_camera"], dtype=float)
         print(
-            f"[viser] {camera} camera calibration: frame={mount_frame}, source={source_key}, "
+            f"[viser] {camera} camera calibration: frame={mount_frame}, "
             f"offset={T_mount_camera[:3, 3]}"
         )
-        if camera_model is not None:
-            print(
-                f"[viser] {camera} camera model: KB4/fisheye, "
-                f"rectified vfov={np.degrees(camera_model.fov):.1f} deg, "
-                f"aspect={camera_model.aspect:.3f}"
-            )
-        if offset_m > 0.75:
-            print(f"[viser] Warning: {camera} camera calibration offset is {offset_m:.3f} m.")
+        print(
+            f"[viser] {camera} camera model: KB4/fisheye, "
+            f"rectified vfov={np.degrees(camera_model.fov):.1f} deg, "
+            f"aspect={camera_model.aspect:.3f}"
+        )
         return {
             "mount_frame": mount_frame,
-            "source_key": source_key,
             "T_mount_camera": T_mount_camera,
             "camera_model": camera_model,
         }
@@ -449,17 +374,15 @@ class ViserControlInterface:
                 axes_length=0.06,
                 axes_radius=0.002,
             )
-            camera_model = calibration.get("camera_model")
-            fov = float(np.radians(95.0)) if camera_model is None else camera_model.fov
-            aspect = 1.6 if camera_model is None else camera_model.aspect
+            camera_model = calibration["camera_model"]
             camera_frustums[camera] = server.scene.add_camera_frustum(
                 f"calibrated_camera/{camera}/frustum",
-                fov=fov,
-                aspect=aspect,
+                fov=camera_model.fov,
+                aspect=camera_model.aspect,
                 scale=_DEFAULT_FRUSTUM_SCALE,
                 line_width=2.0,
                 color=frustum_colors.get(camera, (40, 200, 255)),
-                image=None if self._camera_feed is None else self._camera_feed.latest_rgb(camera),
+                image=self._camera_feed.latest_rgb(camera),
                 format="jpeg",
                 jpeg_quality=70,
             )
@@ -526,37 +449,23 @@ class ViserControlInterface:
             )
 
         # ---- GUI — camera feed -----------------------------------------------
-        if self._camera_feed is not None or self._camera_browser_url is not None or self._camera_mount_frame is not None:
-            with server.gui.add_folder("Camera"):
-                server.gui.add_markdown(f"**Mount frame:** `{self._camera_mount_frame}`")
-                if self._camera_calibrations:
-                    names = ", ".join(sorted(self._camera_calibrations))
-                    server.gui.add_markdown(f"**Calibrated cameras:** `{names}`")
-                    frustum_scale_slider = server.gui.add_slider(
-                        "Frustum length",
-                        min=0.02,
-                        max=0.50,
-                        step=0.01,
-                        initial_value=_DEFAULT_FRUSTUM_SCALE,
-                    )
-                else:
-                    frustum_scale_slider = None
-                if self._camera_feed is not None:
-                    image = self._camera_feed.latest_full_rgb()
-                    if image is None:
-                        image = np.zeros((120, 400, 3), dtype=np.uint8)
-                    camera_sidebar_image = server.gui.add_image(
-                        image,
-                        label="video2 full frame",
-                        format="jpeg",
-                        jpeg_quality=70,
-                    )
-                elif self._camera_browser_url is not None:
-                    server.gui.add_html(
-                        f"<img src='{self._camera_browser_url}' style='width:100%;display:block'>"
-                    )
-        else:
-            frustum_scale_slider = None
+        with server.gui.add_folder("Camera"):
+            server.gui.add_markdown(f"**Mount frame:** `{self._camera_mount_frame}`")
+            names = ", ".join(sorted(self._camera_calibrations))
+            server.gui.add_markdown(f"**Calibrated cameras:** `{names}`")
+            frustum_scale_slider = server.gui.add_slider(
+                "Frustum length",
+                min=0.02,
+                max=0.50,
+                step=0.01,
+                initial_value=_DEFAULT_FRUSTUM_SCALE,
+            )
+            camera_sidebar_image = server.gui.add_image(
+                self._camera_feed.latest_full_rgb(),
+                label="video2 full frame",
+                format="jpeg",
+                jpeg_quality=70,
+            )
 
         # ---- GUI — mode ------------------------------------------------------
         with server.gui.add_folder("Mode"):
@@ -729,14 +638,8 @@ class ViserControlInterface:
                     frustum.wxyz = self._mat3_to_wxyz(T_camera[:3, :3])
                     if frustum_scale_slider is not None:
                         frustum.scale = frustum_scale_slider.value
-                    if self._camera_feed is not None:
-                        image = self._camera_feed.latest_rgb(camera)
-                        if image is not None:
-                            frustum.image = image
-                if camera_sidebar_image is not None and self._camera_feed is not None:
-                    image = self._camera_feed.latest_full_rgb()
-                    if image is not None:
-                        camera_sidebar_image.image = image
+                    frustum.image = self._camera_feed.latest_rgb(camera)
+                camera_sidebar_image.image = self._camera_feed.latest_full_rgb()
 
                 if self._with_teaching_handle:
                     handle_state = self._get_teaching_handle_state()
