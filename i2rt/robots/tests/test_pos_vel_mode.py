@@ -6,6 +6,7 @@ import can
 import numpy as np
 import pytest
 
+from i2rt.motor_drivers import dm_driver
 from i2rt.motor_drivers.dm_driver import ControlMode, DMChainCanInterface, DMSingleMotorCanInterface, MotorRegister
 from i2rt.motor_drivers.utils import FeedbackFrameInfo, MotorInfo, MotorType
 from i2rt.robots.motor_chain_robot import MotorChainRobot
@@ -124,6 +125,36 @@ def test_motor_chain_rejects_non_mit_startup_mode() -> None:
             control_mode=ControlMode.POS_VEL,
             start_thread=False,
         )
+
+
+def test_motor_chain_syncs_hardware_mit_mode_on_startup(monkeypatch: pytest.MonkeyPatch) -> None:
+    interfaces: list[Any] = []
+
+    class FakeSingleMotorInterface:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.mode_writes: list[tuple[int, str]] = []
+            interfaces.append(self)
+
+        def _drain_bus(self, timeout_s: float) -> int:
+            return 0
+
+        def motor_on(self, motor_id: int, motor_type: str) -> FeedbackFrameInfo:
+            return _feedback()
+
+        def switch_control_mode(self, motor_id: int, control_mode: str) -> None:
+            self.mode_writes.append((motor_id, control_mode))
+
+    monkeypatch.setattr(dm_driver, "DMSingleMotorCanInterface", FakeSingleMotorInterface)
+
+    chain = DMChainCanInterface(
+        motor_list=[(0x04, MotorType.DM4340)],
+        motor_offset=np.array([0.0]),
+        motor_direction=np.array([1.0]),
+        start_thread=False,
+    )
+
+    assert interfaces[0].mode_writes == [(0x04, ControlMode.MIT)]
+    assert chain.get_control_mode() == ControlMode.MIT
 
 
 class FakeMotorChain:

@@ -550,6 +550,7 @@ class DMChainCanInterface(MotorChain):
 
             self.absolute_positions = None
             self._motor_on()
+            self._write_control_mode_registers(ControlMode.MIT)
         starting_command = []
         for motor_state in self.state:
             starting_command.append(MotorCmd(torque=motor_state.torque))
@@ -783,12 +784,15 @@ class DMChainCanInterface(MotorChain):
             motor_feedback.append(fd_back)
         return motor_feedback
 
+    def _write_control_mode_registers(self, control_mode: str) -> None:
+        for motor_id, _motor_type in self.motor_list:
+            self.motor_interface.switch_control_mode(motor_id, control_mode)
+            time.sleep(0.003)
+
     def set_control_mode(self, control_mode: str) -> None:
         ControlMode.get_id_offset(control_mode)
         with self.command_lock:
-            for motor_id, _motor_type in self.motor_list:
-                self.motor_interface.switch_control_mode(motor_id, control_mode)
-                time.sleep(0.003)
+            self._write_control_mode_registers(control_mode)
             self.motor_interface.control_mode = control_mode
             self.motor_interface.cmd_idoffset = ControlMode.get_id_offset(control_mode)
             self.control_mode = control_mode

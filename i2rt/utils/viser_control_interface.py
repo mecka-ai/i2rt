@@ -41,8 +41,10 @@ _BTN_LABELS = ["SYNC", "RECORD"]
 _CAMERA_MOUNT_BODY_ID = 4
 _CAMERA_MOUNT_OFFSET_LOCAL = np.array([-0.11963644, 0.04517079, -0.03549660])
 _DEFAULT_FRUSTUM_SCALE = 0.12
-_SAFE_TORQUE_LIMIT_NM = 2.0
+_DEFAULT_TORQUE_LIMIT_NM = 2.0
+_MAX_TORQUE_LIMIT_NM = 4.0
 _DEFAULT_PROFILE_MAX_VELOCITY = 0.5
+_MAX_PROFILE_MAX_VELOCITY = 4.0
 _DEFAULT_PROFILE_ACCELERATION = 1.0
 
 
@@ -438,22 +440,6 @@ class ViserControlInterface:
             enable_btn = server.gui.add_button("Enable Robot")
             enable_btn.disabled = True
             status_md = server.gui.add_markdown("**Status:** DISABLED (read-only)")
-            torque_limit_slider = server.gui.add_slider(
-                "Torque limit (Nm)",
-                min=0.0,
-                max=_SAFE_TORQUE_LIMIT_NM,
-                step=0.05,
-                initial_value=float(
-                    np.clip(info["clip_motor_torque"], 0.0, _SAFE_TORQUE_LIMIT_NM)
-                ),
-            )
-            gain_scale_slider = server.gui.add_slider(
-                "PD gain scale",
-                min=0.0,
-                max=1.0,
-                step=0.05,
-                initial_value=self._gain_scale,
-            )
 
         # ---- GUI — motor command mode ----------------------------------------
         with server.gui.add_folder("Motor Profile"):
@@ -464,21 +450,41 @@ class ViserControlInterface:
                 if info.get("control_mode", ControlMode.MIT) == ControlMode.POS_VEL
                 else "MIT + gravity comp",
             )
+            torque_limit_slider = server.gui.add_slider(
+                "Torque limit (Nm)",
+                min=0.0,
+                max=_MAX_TORQUE_LIMIT_NM,
+                step=0.05,
+                initial_value=float(
+                    _DEFAULT_TORQUE_LIMIT_NM
+                    if np.isinf(info.get("clip_motor_torque", np.inf))
+                    else np.clip(info["clip_motor_torque"], 0.0, _MAX_TORQUE_LIMIT_NM)
+                ),
+            )
+            gain_scale_slider = server.gui.add_slider(
+                "PD gain scale",
+                min=0.0,
+                max=1.0,
+                step=0.05,
+                initial_value=self._gain_scale,
+            )
             profile_velocity_slider = server.gui.add_slider(
                 "Max velocity (rad/s)",
                 min=0.05,
-                max=2.0,
+                max=_MAX_PROFILE_MAX_VELOCITY,
                 step=0.05,
                 initial_value=float(info.get("profile_max_velocity", _DEFAULT_PROFILE_MAX_VELOCITY)),
             )
             profile_accel_slider = server.gui.add_slider(
-                "Accel (rad/s^2)",
+                "Accel/decel (rad/s^2)",
                 min=0.1,
                 max=5.0,
                 step=0.1,
                 initial_value=float(info.get("profile_acceleration", _DEFAULT_PROFILE_ACCELERATION)),
             )
             motor_mode_dd.disabled = True
+            torque_limit_slider.disabled = True
+            gain_scale_slider.disabled = True
             profile_velocity_slider.disabled = True
             profile_accel_slider.disabled = True
 
@@ -562,16 +568,36 @@ class ViserControlInterface:
             return ControlMode.POS_VEL if motor_mode_dd.value == "POS-VEL profile" else ControlMode.MIT
 
         def _set_profile_widgets_enabled() -> None:
-            supported = has_profile_control and state["enabled"]
-            motor_mode_dd.disabled = not supported
-            profile_enabled = supported and _selected_motor_mode() == ControlMode.POS_VEL
+            supported = has_profile_control
+            enabled = supported and state["enabled"]
+            selected = _selected_motor_mode()
+            profile_selected = selected == ControlMode.POS_VEL
+            mit_selected = selected == ControlMode.MIT
+            profile_enabled = enabled and profile_selected
+            mit_enabled = enabled and mit_selected
+            motor_mode_dd.visible = supported
+            torque_limit_slider.visible = supported and mit_selected
+            gain_scale_slider.visible = supported and mit_selected
+            profile_velocity_slider.visible = supported and profile_selected
+            profile_accel_slider.visible = supported and profile_selected
+            motor_mode_dd.disabled = not enabled
+            torque_limit_slider.disabled = not mit_enabled
+            gain_scale_slider.disabled = not mit_enabled
             profile_velocity_slider.disabled = not profile_enabled
             profile_accel_slider.disabled = not profile_enabled
+            for slider in kp_sliders + kd_sliders:
+                slider.visible = supported and mit_selected
+                slider.disabled = not mit_enabled
+            if apply_btn is not None:
+                apply_btn.visible = supported and mit_selected
+                apply_btn.disabled = not mit_enabled
 
-        def _apply_profile_limits() -> None:
+        def _apply_motor_profile_settings() -> None:
             if not has_profile_control:
                 return
             self._robot.set_profile_limits(float(profile_velocity_slider.value), float(profile_accel_slider.value))
+
+        _set_profile_widgets_enabled()
 
         @align_cb.on_update
         def _(_: object) -> None:
@@ -645,20 +671,18 @@ class ViserControlInterface:
                 return
             selected = _selected_motor_mode()
             self._robot.set_motor_control_mode(selected)
-            if selected == ControlMode.POS_VEL:
-                _apply_profile_limits()
-            elif not (state["enabled"] and state["mode"] in ("ik", "joint")):
+            if selected != ControlMode.POS_VEL and not (state["enabled"] and state["mode"] in ("ik", "joint")):
                 self._enter_vis_grav_comp()
             print(f"[viser] Motor command mode set to {selected}")
             _set_profile_widgets_enabled()
 
         @profile_velocity_slider.on_update
         def _(_: object) -> None:
-            _apply_profile_limits()
+            _apply_motor_profile_settings()
 
         @profile_accel_slider.on_update
         def _(_: object) -> None:
-            _apply_profile_limits()
+            _apply_motor_profile_settings()
 
         if apply_btn is not None:
 

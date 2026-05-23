@@ -63,7 +63,7 @@ def _get_gripper_only_robot(
     channel: str = "can0",
     gripper_type: GripperType = GripperType.LINEAR_4310,
     sim: bool = False,
-    control_mode: str = ControlMode.MIT,
+    control_mode: str = ControlMode.POS_VEL,
     profile_max_velocity: float = 0.5,
     profile_acceleration: float = 1.0,
 ) -> "Robot":
@@ -155,7 +155,7 @@ def get_yam_robot(
     sim: bool = False,
     joint_state_saver_factory: Optional[Callable[[], Any]] = None,
     set_realtime_and_pin_callback: Optional[Callable[[int], None]] = None,
-    control_mode: str = ControlMode.MIT,
+    control_mode: str = ControlMode.POS_VEL,
     profile_max_velocity: float = 0.5,
     profile_acceleration: float = 1.0,
 ) -> "Robot":
@@ -174,7 +174,7 @@ def get_yam_robot(
         gripper_kp: Optional gripper kp override. Defaults to gripper_type's default.
         gripper_kd: Optional gripper kd override. Defaults to gripper_type's default.
         sim: If True, return a SimRobot instead of connecting to real hardware.
-        control_mode: Runtime motor command mode. Defaults to MIT. POS_VEL uses onboard profiled moves.
+        control_mode: Runtime motor command mode. Defaults to POS_VEL, which uses onboard profiled moves.
         profile_max_velocity: POS_VEL maximum speed in rad/s.
         profile_acceleration: POS_VEL acceleration magnitude in rad/s^2.
     """
