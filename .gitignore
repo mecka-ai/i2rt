@@ -4,6 +4,7 @@ __pycache__/
 *$PYTHON_EXTENSIONS
 
 # Virtual environment
+.venv/
 venv/
 env/
 
