@@ -15,15 +15,21 @@ Deploy local changes from the laptop:
 
 ```bash
 cd /Users/theol/Documents/github/elevator_detection
-rsync -a --filter=':- .gitignore' --exclude='.git/' --stats ./ radxa@atlascm7660:/home/radxa/elevator_detection/
+rsync -a --filter=':- .gitignore' --exclude='.git/' --exclude='.venv/' --exclude='*/.venv/' --stats ./ radxa@atlascm7660:/home/radxa/elevator_detection/
 ```
 
-This copies the whole repo while respecting `.gitignore`, so local virtualenvs, caches, and bytecode are skipped. The CM5 uses the synced checkout at `/home/radxa/elevator_detection`; the older `/home/radxa/i2rt` path is not the deployment target for this workflow.
+This copies the whole repo while respecting `.gitignore`, so local virtualenvs, caches, and bytecode are skipped. The CM5 runs the synced code from `/home/radxa/elevator_detection` using the canonical environment at `/home/radxa/elevator_detection/.venv/bin/python`.
+
+Stop existing camera/viser processes:
+
+```bash
+ssh radxa@atlascm7660 "pkill -f '[c]ontrol_with_viser.py' || true; pkill -f '[c]am_server.py' || true"
+```
 
 Run viser from the laptop:
 
 ```bash
-ssh radxa@atlascm7660 "pkill -f '[c]ontrol_with_viser.py' || true; pkill -f '[c]am_server.py' || true; cd /home/radxa/elevator_detection/i2rt && .venv/bin/python -u examples/control_with_viser/control_with_viser.py"
+ssh radxa@atlascm7660 "cd /home/radxa/elevator_detection/i2rt && ../.venv/bin/python -u examples/control_with_viser/control_with_viser.py"
 ```
 
 Open:
@@ -44,11 +50,11 @@ Hand-eye calibration outputs are discovered from:
 Run right-camera calibration:
 
 ```bash
-ssh -t radxa@atlascm7660 "pkill -f '[c]ontrol_with_viser.py' || true; pkill -f '[c]am_server.py' || true; cd /home/radxa/elevator_detection && i2rt/.venv/bin/python calibration/capture_hand_eye.py right"
+ssh -t radxa@atlascm7660 "cd /home/radxa/elevator_detection && .venv/bin/python calibration/capture_hand_eye.py right"
 ```
 
 Run left-camera calibration:
 
 ```bash
-ssh -t radxa@atlascm7660 "pkill -f '[c]ontrol_with_viser.py' || true; pkill -f '[c]am_server.py' || true; cd /home/radxa/elevator_detection && i2rt/.venv/bin/python calibration/capture_hand_eye.py left"
+ssh -t radxa@atlascm7660 "cd /home/radxa/elevator_detection && .venv/bin/python calibration/capture_hand_eye.py left"
 ```
