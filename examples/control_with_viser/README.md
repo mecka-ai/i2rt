@@ -15,11 +15,12 @@ uv pip install --python .venv/bin/python -e ../i2rt -e .
 .venv/bin/robot-control-server --host 0.0.0.0 --port 8765
 ```
 
-Over SSH, use a login shell and the explicit Radxa `uv` path:
+Over SSH, use the explicit Radxa `uv` path. Allocate a TTY for foreground
+processes so Ctrl-C reaches the remote process and hardware is released cleanly:
 
 ```bash
-ssh radxa@atlascm7660 'bash -lc "cd /home/radxa/elevator_detection/robot_control && UV=/home/radxa/.local/bin/uv && \$UV venv --allow-existing .venv && \$UV pip install --python .venv/bin/python -e ../i2rt -e ."'
-ssh radxa@atlascm7660 'bash -lc "cd /home/radxa/elevator_detection/robot_control && .venv/bin/robot-control-server --host 0.0.0.0 --port 8765"'
+ssh radxa@atlascm7660 "cd /home/radxa/elevator_detection/robot_control && /home/radxa/.local/bin/uv venv --allow-existing .venv && /home/radxa/.local/bin/uv pip install --python .venv/bin/python -e ../i2rt -e ."
+ssh -tt radxa@atlascm7660 "cd /home/radxa/elevator_detection/robot_control && .venv/bin/robot-control-server --host 0.0.0.0 --port 8765"
 ```
 
 Then start Viser. Viser connects to `ws://127.0.0.1:8765`; it does not open
