@@ -13,9 +13,8 @@ A PD-gains panel is shown for robots that expose kp/kd (MotorChainRobot).
 See examples/control_with_viser/ for a runnable entry-point and README.
 """
 
-import json
 import time
-from pathlib import Path
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import mujoco
@@ -25,11 +24,6 @@ from i2rt.motor_drivers.dm_driver import ControlMode, PassiveEncoderInfo
 from i2rt.robots.kinematics import Kinematics
 from i2rt.robots.motor_chain_robot import MotorChainRobot
 from i2rt.robots.robot import Robot
-from i2rt.utils.nexus_camera import (
-    CAMERAS,
-    NexusCamera,
-    model_from_repo_camera_data,
-)
 
 # Teaching-handle button indicator visuals (mirrors mujoco_control_interface.py)
 _BTN_OFF_RGB = (89, 89, 89)
@@ -48,6 +42,12 @@ _MAX_PROFILE_MAX_VELOCITY = 4.0
 _DEFAULT_PROFILE_ACCELERATION = 1.0
 
 
+@dataclass(frozen=True)
+class FrustumCameraModel:
+    fov: float
+    aspect: float
+
+
 class ViserControlInterface:
     """Browser-based robot visualiser and controller with a safety gate.
 
@@ -60,12 +60,12 @@ class ViserControlInterface:
         self,
         robot: Robot,
         xml_path: str,
-        camera_calibrations: Dict[str, str],
+        camera_calibrations: Dict[str, Any],
+        camera_feed: Any,
         ee_site: str = "grasp_site",
         dt: float = 0.02,
         port: int = 8080,
         camera_mount_frame: str = "geom_4_top",
-        camera_feed: Any | None = None,
     ) -> None:
         self._robot = robot
         self._ee_site = ee_site
@@ -73,12 +73,7 @@ class ViserControlInterface:
         self._port = port
         self._camera_mount_frame = camera_mount_frame
         self._camera_calibrations = self._load_camera_calibrations(camera_calibrations, camera_mount_frame)
-        self._owns_camera_feed = camera_feed is None
-        self._camera_feed = camera_feed or NexusCamera(
-            cameras=CAMERAS.keys(),
-            models={name: calibration["camera_model"] for name, calibration in self._camera_calibrations.items()},
-            start_thread=True,
-        )
+        self._camera_feed = camera_feed
 
         self._model = mujoco.MjModel.from_xml_path(xml_path)
         self._data = mujoco.MjData(self._model)
@@ -115,22 +110,22 @@ class ViserControlInterface:
     def from_robot(
         cls,
         robot: Robot,
-        camera_calibrations: Dict[str, str],
+        camera_calibrations: Dict[str, Any],
+        camera_feed: Any,
         ee_site: str = "grasp_site",
         dt: float = 0.02,
         port: int = 8080,
         camera_mount_frame: str = "geom_4_top",
-        camera_feed: Any | None = None,
     ) -> "ViserControlInterface":
         return cls(
             robot,
             robot.xml_path,
             camera_calibrations,
+            camera_feed,
             ee_site,
             dt,
             port,
             camera_mount_frame=camera_mount_frame,
-            camera_feed=camera_feed,
         )
 
     # ---- MuJoCo helpers -------------------------------------------------------
@@ -238,25 +233,23 @@ class ViserControlInterface:
     @classmethod
     def _load_camera_calibrations(
         cls,
-        paths: Dict[str, str],
+        calibrations: Dict[str, Any],
         mount_frame: str,
     ) -> Dict[str, Dict[str, Any]]:
         return {
-            camera: cls._load_camera_calibration(camera, path, mount_frame)
-            for camera, path in paths.items()
+            camera: cls._load_camera_calibration(camera, calibration, mount_frame)
+            for camera, calibration in calibrations.items()
         }
 
     @staticmethod
     def _load_camera_calibration(
         camera: str,
-        path: str,
+        calibration: Dict[str, Any],
         mount_frame: str,
     ) -> Dict[str, Any]:
-        p = Path(path).expanduser()
-
-        payload = json.loads(p.read_text())
-        camera_model = model_from_repo_camera_data(camera)
-        T_mount_camera = np.asarray(payload["T_mount_camera"], dtype=float)
+        T_mount_camera = np.asarray(calibration["T_mount_camera"], dtype=float)
+        model = calibration["model"]
+        camera_model = FrustumCameraModel(fov=float(model["fov"]), aspect=float(model["aspect"]))
         print(
             f"[viser] {camera} camera calibration: frame={mount_frame}, "
             f"offset={T_mount_camera[:3, 3]}"
@@ -848,6 +841,5 @@ class ViserControlInterface:
         except KeyboardInterrupt:
             pass
 
-        if self._camera_feed is not None and self._owns_camera_feed:
-            self._camera_feed.close()
+        self._camera_feed.close()
         print("[viser] Stopped")

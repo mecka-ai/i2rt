@@ -21,7 +21,16 @@ cd /home/radxa/elevator_detection/i2rt
 ../.venv/bin/python examples/control_with_viser/control_with_viser.py
 ```
 
-Then open `http://localhost:8080` in your browser.
+To run Viser locally on a laptop while the robot service runs on the CM5:
+
+```bash
+cd /Users/theol/Documents/github/elevator_detection/i2rt
+PYTHONPATH=../robot_control/src:. uv run python examples/control_with_viser/control_with_viser.py \
+  --robot-control-url ws://atlascm7660:8765
+```
+
+On the CM5, open `http://atlascm7660:8080` from your laptop. When Viser is
+running locally, open `http://localhost:8080`.
 
 ## Safety Gate
 
@@ -49,6 +58,5 @@ Directly control each joint angle (in degrees) and the gripper position using in
 
 ## Configuration
 
-The current example is fixed to the deployed YAM + no-gripper setup and the
-local robot-control service URL. Change `ROBOT_CONTROL_URL` in
-`control_with_viser.py` if Viser is running on a different host.
+The current example is fixed to the deployed YAM + no-gripper setup. Use
+`--robot-control-url` to choose the robot service host.

@@ -35,16 +35,25 @@ Start the robot-control service:
 ssh radxa@atlascm7660 "cd /home/radxa/elevator_detection/robot_control && ../.venv/bin/python -u -m robot_control.server --host 0.0.0.0 --port 8765"
 ```
 
-In a second shell, run Viser:
+In a second shell, run Viser on the CM5:
 
 ```bash
 ssh radxa@atlascm7660 "cd /home/radxa/elevator_detection/i2rt && ../.venv/bin/python -u examples/control_with_viser/control_with_viser.py"
 ```
 
+Or run Viser locally on the laptop:
+
+```bash
+cd /Users/theol/Documents/github/elevator_detection/i2rt
+PYTHONPATH=../robot_control/src:. uv run python examples/control_with_viser/control_with_viser.py \
+  --robot-control-url ws://atlascm7660:8765
+```
+
 Open:
 
 ```text
-http://atlascm7660:8080/
+http://localhost:8080/      # local Viser
+http://atlascm7660:8080/    # CM5 Viser
 ```
 
 No separate browser-visible camera server is needed. Viser never opens the
