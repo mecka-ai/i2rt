@@ -11,8 +11,7 @@ from typing import Any, Iterable
 import numpy as np
 import yaml
 
-DEVICE_INDEX = 2
-DEVICE = f"/dev/video{DEVICE_INDEX}"
+DEVICE = Path("/dev/v4l/by-id/usb-JHH_Atlas_Nexus2_ATLASHX1299-video-index0")
 REPO_ROOT = Path(__file__).resolve().parents[3]
 REPO_CAMERA_DATA_DIR = REPO_ROOT / "calibration" / "camera_data" / "kb4_6cam" / "per_camera_yaml"
 FRAME_SIZE = (4000, 1200)
@@ -35,6 +34,10 @@ CAMERAS = {
     "left": CameraSpec("left", index=0, x0=160, x1=2080),
     "right": CameraSpec("right", index=1, x0=2080, x1=4000),
 }
+
+
+def find_nexus_device() -> str:
+    return str(DEVICE)
 
 
 def camera_spec(name: str) -> CameraSpec:
@@ -141,6 +144,7 @@ class NexusCamera:
 
         self._cv2 = cv2
         self._cameras = tuple(camera_spec(name).name for name in cameras)
+        self._device = find_nexus_device()
         self._maps = {
             name: models[name].undistort_maps(cv2)
             for name in self._cameras
@@ -158,14 +162,14 @@ class NexusCamera:
             self._thread.start()
 
     def _open_capture(self) -> Any:
-        cap = self._cv2.VideoCapture(DEVICE_INDEX, self._cv2.CAP_V4L2)
+        cap = self._cv2.VideoCapture(self._device, self._cv2.CAP_V4L2)
         cap.set(self._cv2.CAP_PROP_FOURCC, self._cv2.VideoWriter_fourcc(*"MJPG"))
         cap.set(self._cv2.CAP_PROP_FRAME_WIDTH, FRAME_SIZE[0])
         cap.set(self._cv2.CAP_PROP_FRAME_HEIGHT, FRAME_SIZE[1])
         cap.set(self._cv2.CAP_PROP_FPS, 30)
         cap.set(self._cv2.CAP_PROP_BUFFERSIZE, 1)
         if not cap.isOpened():
-            raise RuntimeError(f"could not open {DEVICE}")
+            raise RuntimeError(f"could not open {self._device}")
         return cap
 
     def close(self) -> None:
@@ -180,7 +184,7 @@ class NexusCamera:
         for _ in range(max(1, flush_frames)):
             ok, frame = self._cap.read()
         if not ok or frame is None:
-            raise RuntimeError(f"failed to read {DEVICE}")
+            raise RuntimeError(f"failed to read {self._device}")
         return time.time(), frame
 
     def read_camera(self, camera: str, flush_frames: int = 1) -> tuple[float, np.ndarray]:
