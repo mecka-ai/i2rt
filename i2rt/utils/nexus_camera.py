@@ -32,7 +32,7 @@ class CameraSpec:
 
 
 CAMERAS = {
-    "left": CameraSpec("left", index=0, x0=0, x1=1920),
+    "left": CameraSpec("left", index=0, x0=160, x1=2080),
     "right": CameraSpec("right", index=1, x0=2080, x1=4000),
 }
 

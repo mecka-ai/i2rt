@@ -39,8 +39,7 @@ _BTN_RADIUS = 0.022
 _BTN_Z_OFFSETS = [0.10, 0.04]
 _BTN_LABELS = ["SYNC", "RECORD"]
 _CAMERA_MOUNT_BODY_ID = 4
-_CAMERA_MOUNT_GEOM_ID = 4
-_CAMERA_MOUNT_OFFSET = np.array([0.0, 0.0, 0.08])
+_CAMERA_MOUNT_OFFSET_LOCAL = np.array([-0.11963644, 0.04517079, -0.03549660])
 _DEFAULT_FRUSTUM_SCALE = 0.12
 _SAFE_TORQUE_LIMIT_NM = 2.0
 
@@ -625,7 +624,7 @@ class ViserControlInterface:
                 R_mount = self._data.xmat[_CAMERA_MOUNT_BODY_ID].reshape(3, 3)
                 T_mount = np.eye(4)
                 T_mount[:3, :3] = R_mount
-                T_mount[:3, 3] = self._data.geom_xpos[_CAMERA_MOUNT_GEOM_ID] + _CAMERA_MOUNT_OFFSET
+                T_mount[:3, 3] = self._data.xpos[_CAMERA_MOUNT_BODY_ID] + R_mount @ _CAMERA_MOUNT_OFFSET_LOCAL
                 camera_mount_frame.position = T_mount[:3, 3]
                 camera_mount_frame.wxyz = self._mat3_to_wxyz(T_mount[:3, :3])
 
