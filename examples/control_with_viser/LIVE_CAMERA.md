@@ -11,14 +11,10 @@ rsync -a --filter=':- .gitignore' --exclude='.git/' --stats ./ radxa@atlascm7660
 
 This copies the whole repo while respecting `.gitignore`, so local virtualenvs, caches, and bytecode are skipped. The CM5 uses the synced checkout at `/home/radxa/elevator_detection`; the older `/home/radxa/i2rt` path is not the deployment target for this workflow.
 
-Run on the CM5:
+Run viser from the laptop:
 
 ```bash
-ssh radxa@atlascm7660
-pkill -f '[c]ontrol_with_viser.py'
-pkill -f '[c]am_server.py'
-cd /home/radxa/elevator_detection/i2rt
-.venv/bin/python -u examples/control_with_viser/control_with_viser.py
+ssh radxa@atlascm7660 "pkill -f '[c]ontrol_with_viser.py' || true; pkill -f '[c]am_server.py' || true; cd /home/radxa/elevator_detection/i2rt && .venv/bin/python -u examples/control_with_viser/control_with_viser.py"
 ```
 
 Open:
@@ -39,13 +35,11 @@ Hand-eye calibration outputs are discovered from:
 Run right-camera calibration:
 
 ```bash
-cd /home/radxa/elevator_detection
-i2rt/.venv/bin/python calibration/capture_hand_eye.py right
+ssh -t radxa@atlascm7660 "pkill -f '[c]ontrol_with_viser.py' || true; pkill -f '[c]am_server.py' || true; cd /home/radxa/elevator_detection && i2rt/.venv/bin/python calibration/capture_hand_eye.py right"
 ```
 
 Run left-camera calibration:
 
 ```bash
-cd /home/radxa/elevator_detection
-i2rt/.venv/bin/python calibration/capture_hand_eye.py left
+ssh -t radxa@atlascm7660 "pkill -f '[c]ontrol_with_viser.py' || true; pkill -f '[c]am_server.py' || true; cd /home/radxa/elevator_detection && i2rt/.venv/bin/python calibration/capture_hand_eye.py left"
 ```
