@@ -39,6 +39,7 @@ _BTN_LABELS = ["SYNC", "RECORD"]
 _CAMERA_MOUNT_BODY_ID = 4
 _CAMERA_MOUNT_GEOM_ID = 4
 _CAMERA_MOUNT_OFFSET = np.array([0.0, 0.0, 0.08])
+_CAMERA_FRAME_SIZE = (4000, 1200)
 _RIGHT_CAMERA_SIZE = (1920.0, 1200.0)
 _RIGHT_CAMERA_CROP = np.s_[:1200, 2080:4000]
 _DEFAULT_FRUSTUM_SCALE = 0.12
@@ -64,14 +65,14 @@ def _browser_visible_url(url: Optional[str]) -> Optional[str]:
 class _CameraFeed:
     def __init__(
         self,
-        url: str,
+        source: str,
         camera_matrix: Optional[np.ndarray],
         distortion: Optional[np.ndarray],
     ) -> None:
         import cv2
 
         self._cv2 = cv2
-        self._cap = cv2.VideoCapture(url)
+        self._cap = self._open_capture(source)
         self._map1 = None
         self._map2 = None
         if camera_matrix is not None and distortion is not None and len(distortion.reshape(-1)) == 4:
@@ -84,15 +85,35 @@ class _CameraFeed:
                 size,
                 cv2.CV_16SC2,
             )
-        self._image: Optional[np.ndarray] = None
+        self._full_image: Optional[np.ndarray] = None
+        self._frustum_image: Optional[np.ndarray] = None
         self._lock = threading.Lock()
         self._stop = False
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def image(self) -> Optional[np.ndarray]:
+    def _open_capture(self, source: str) -> Any:
+        if source.startswith("/dev/video"):
+            dev_index = int(source.removeprefix("/dev/video"))
+            cap = self._cv2.VideoCapture(dev_index, self._cv2.CAP_V4L2)
+            cap.set(self._cv2.CAP_PROP_FOURCC, self._cv2.VideoWriter_fourcc(*"MJPG"))
+            cap.set(self._cv2.CAP_PROP_FRAME_WIDTH, _CAMERA_FRAME_SIZE[0])
+            cap.set(self._cv2.CAP_PROP_FRAME_HEIGHT, _CAMERA_FRAME_SIZE[1])
+            cap.set(self._cv2.CAP_PROP_FPS, 30)
+            cap.set(self._cv2.CAP_PROP_BUFFERSIZE, 1)
+        else:
+            cap = self._cv2.VideoCapture(source)
+        if not cap.isOpened():
+            raise RuntimeError(f"could not open camera source {source!r}")
+        return cap
+
+    def full_image(self) -> Optional[np.ndarray]:
         with self._lock:
-            return None if self._image is None else self._image.copy()
+            return None if self._full_image is None else self._full_image.copy()
+
+    def frustum_image(self) -> Optional[np.ndarray]:
+        with self._lock:
+            return None if self._frustum_image is None else self._frustum_image.copy()
 
     def close(self) -> None:
         self._stop = True
@@ -105,11 +126,17 @@ class _CameraFeed:
             if not ok:
                 time.sleep(0.2)
                 continue
-            frame = frame[_RIGHT_CAMERA_CROP]
+            frustum_frame = frame[_RIGHT_CAMERA_CROP]
             if self._map1 is not None and self._map2 is not None:
-                frame = self._cv2.remap(frame, self._map1, self._map2, interpolation=self._cv2.INTER_LINEAR)
+                frustum_frame = self._cv2.remap(
+                    frustum_frame,
+                    self._map1,
+                    self._map2,
+                    interpolation=self._cv2.INTER_LINEAR,
+                )
             with self._lock:
-                self._image = self._cv2.cvtColor(frame, self._cv2.COLOR_BGR2RGB)
+                self._full_image = self._cv2.cvtColor(frame, self._cv2.COLOR_BGR2RGB)
+                self._frustum_image = self._cv2.cvtColor(frustum_frame, self._cv2.COLOR_BGR2RGB)
 
 
 class ViserControlInterface:
@@ -148,10 +175,10 @@ class ViserControlInterface:
         self._camera_feed = (
             _CameraFeed(
                 camera_stream_url,
-                self._camera_calibration.get("camera_matrix"),
-                self._camera_calibration.get("distortion"),
+                None if self._camera_calibration is None else self._camera_calibration.get("camera_matrix"),
+                None if self._camera_calibration is None else self._camera_calibration.get("distortion"),
             )
-            if camera_stream_url is not None and self._camera_calibration is not None
+            if camera_stream_url is not None
             else None
         )
 
@@ -477,6 +504,7 @@ class ViserControlInterface:
             axes_length=0.08,
             axes_radius=0.003,
         )
+        camera_sidebar_image = None
         camera_frame = None
         camera_frustum = None
         if self._camera_calibration is not None:
@@ -493,7 +521,7 @@ class ViserControlInterface:
                 scale=_DEFAULT_FRUSTUM_SCALE,
                 line_width=2.0,
                 color=(40, 200, 255),
-                image=None if self._camera_feed is None else self._camera_feed.image(),
+                image=None if self._camera_feed is None else self._camera_feed.frustum_image(),
                 format="jpeg",
                 jpeg_quality=70,
             )
@@ -560,7 +588,7 @@ class ViserControlInterface:
             )
 
         # ---- GUI — camera feed -----------------------------------------------
-        if self._camera_browser_url is not None or self._camera_mount_frame is not None:
+        if self._camera_feed is not None or self._camera_browser_url is not None or self._camera_mount_frame is not None:
             with server.gui.add_folder("Camera"):
                 server.gui.add_markdown(f"**Mount frame:** `{self._camera_mount_frame}`")
                 if self._camera_calibration is not None:
@@ -574,7 +602,17 @@ class ViserControlInterface:
                     )
                 else:
                     frustum_scale_slider = None
-                if self._camera_browser_url is not None:
+                if self._camera_feed is not None:
+                    image = self._camera_feed.full_image()
+                    if image is None:
+                        image = np.zeros((120, 400, 3), dtype=np.uint8)
+                    camera_sidebar_image = server.gui.add_image(
+                        image,
+                        label="video2 full frame",
+                        format="jpeg",
+                        jpeg_quality=70,
+                    )
+                elif self._camera_browser_url is not None:
                     server.gui.add_html(
                         f"<img src='{self._camera_browser_url}' style='width:100%;display:block'>"
                     )
@@ -753,9 +791,13 @@ class ViserControlInterface:
                         if frustum_scale_slider is not None:
                             camera_frustum.scale = frustum_scale_slider.value
                         if self._camera_feed is not None:
-                            image = self._camera_feed.image()
+                            image = self._camera_feed.frustum_image()
                             if image is not None:
                                 camera_frustum.image = image
+                if camera_sidebar_image is not None and self._camera_feed is not None:
+                    image = self._camera_feed.full_image()
+                    if image is not None:
+                        camera_sidebar_image.image = image
 
                 if self._with_teaching_handle:
                     handle_state = self._get_teaching_handle_state()

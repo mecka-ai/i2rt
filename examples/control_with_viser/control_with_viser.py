@@ -15,7 +15,7 @@ PORT = 8080
 CHANNEL = "can0"
 CAMERA_MOUNT_FRAME = "geom_4_top"
 CAMERA_CALIBRATION = "/home/radxa/artifacts/hand_eye/hand_eye.json"
-CAMERA_STREAM_URL = os.environ.get("I2RT_CAMERA_STREAM_URL", "http://127.0.0.1:8090/cam/2")
+CAMERA_STREAM_URL = os.environ.get("I2RT_CAMERA_STREAM_URL", "/dev/video2")
 CAMERA_BROWSER_URL = os.environ.get("I2RT_CAMERA_BROWSER_URL")
 
 
