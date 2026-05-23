@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import threading
 import time
 from dataclasses import dataclass
@@ -10,10 +9,12 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import numpy as np
+import yaml
 
 DEVICE_INDEX = 2
 DEVICE = f"/dev/video{DEVICE_INDEX}"
-DEFAULT_INTRINSICS_PATH = Path("/home/radxa/camera-backend/calibration.json")
+REPO_ROOT = Path(__file__).resolve().parents[3]
+REPO_CAMERA_DATA_DIR = REPO_ROOT / "calibration" / "camera_data" / "kb4_6cam" / "per_camera_yaml"
 FRAME_SIZE = (4000, 1200)
 FISHEYE_UNDISTORT_BALANCE = 0.5
 
@@ -108,10 +109,11 @@ class FisheyeCameraModel:
         return cv2.fisheye.undistortPoints(points.astype(np.float64), self.camera_matrix, self.distortion)
 
 
-def model_from_intrinsics_file(path: Path, camera: str) -> FisheyeCameraModel:
+def model_from_repo_camera_data(camera: str) -> FisheyeCameraModel:
     spec = camera_spec(camera)
-    payload = json.loads(path.expanduser().read_text())
-    record = payload["value0"]["intrinsics"][spec.index]
+    yaml_name = f"{camera}_cam"
+    payload = yaml.safe_load((REPO_CAMERA_DATA_DIR / f"{yaml_name}.yaml").read_text())
+    record = payload[yaml_name]
     intrinsics = record["intrinsics"]
     camera_matrix = np.array(
         [
@@ -126,12 +128,6 @@ def model_from_intrinsics_file(path: Path, camera: str) -> FisheyeCameraModel:
         dtype=np.float64,
     )
     return FisheyeCameraModel.from_intrinsics(camera_matrix, distortion, spec.image_size)
-
-
-def model_from_npz(path: Path, camera: str) -> FisheyeCameraModel:
-    spec = camera_spec(camera)
-    data = np.load(path.expanduser())
-    return FisheyeCameraModel.from_intrinsics(data["camera_matrix"], data["distortion"], spec.image_size)
 
 
 class NexusCamera:

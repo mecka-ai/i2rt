@@ -2,6 +2,15 @@
 
 This setup lets `control_with_viser.py` open `/dev/video2` directly through `i2rt.utils.nexus_camera`. The Camera panel shows the full Nexus2 frame, and each calibrated 3D frustum asks that shared camera object for its own cropped, undistorted frame.
 
+Camera intrinsics come from the synced repo data:
+
+```text
+/home/radxa/elevator_detection/calibration/camera_data/kb4_6cam/per_camera_yaml/left_cam.yaml
+/home/radxa/elevator_detection/calibration/camera_data/kb4_6cam/per_camera_yaml/right_cam.yaml
+```
+
+Do not use `/home/radxa/camera-backend/calibration.json` for this setup. That file is for a different camera serial number.
+
 Deploy local changes from the laptop:
 
 ```bash

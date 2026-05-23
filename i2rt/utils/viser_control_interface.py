@@ -28,7 +28,7 @@ from i2rt.robots.robot import Robot
 from i2rt.utils.nexus_camera import (
     CAMERAS,
     NexusCamera,
-    model_from_npz,
+    model_from_repo_camera_data,
 )
 
 # Teaching-handle button indicator visuals (mirrors mujoco_control_interface.py)
@@ -244,7 +244,7 @@ class ViserControlInterface:
         p = Path(path).expanduser()
 
         payload = json.loads(p.read_text())
-        camera_model = model_from_npz(p.with_suffix(".npz"), camera)
+        camera_model = model_from_repo_camera_data(camera)
         T_mount_camera = np.asarray(payload["T_mount_camera"], dtype=float)
         print(
             f"[viser] {camera} camera calibration: frame={mount_frame}, "
