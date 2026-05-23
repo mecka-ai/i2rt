@@ -5,13 +5,15 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from typing import Any, Iterable
 
 import numpy as np
 import yaml
 
-DEVICE = Path("/dev/v4l/by-id/usb-JHH_Atlas_Nexus2_ATLASHX1299-video-index0")
+DEVICE_ID_SUBSTRING = "Atlas_Nexus2"
+DEVICE_INDEX_SUFFIX = "video-index0"
 REPO_ROOT = Path(__file__).resolve().parents[3]
 REPO_CAMERA_DATA_DIR = REPO_ROOT / "calibration" / "camera_data" / "kb4_6cam" / "per_camera_yaml"
 FRAME_SIZE = (4000, 1200)
@@ -37,7 +39,23 @@ CAMERAS = {
 
 
 def find_nexus_device() -> str:
-    return str(DEVICE)
+    override = os.environ.get("I2RT_NEXUS_CAMERA_DEVICE")
+    if override:
+        return str(Path(override).expanduser().resolve())
+
+    by_id_dir = Path("/dev/v4l/by-id")
+    candidates = sorted(
+        path
+        for path in by_id_dir.glob("*")
+        if DEVICE_ID_SUBSTRING in path.name and path.name.endswith(DEVICE_INDEX_SUFFIX)
+    )
+    if candidates:
+        return str(candidates[0].resolve())
+
+    raise RuntimeError(
+        f"could not find Nexus2 camera in {by_id_dir}; "
+        f"expected name containing {DEVICE_ID_SUBSTRING!r} and ending with {DEVICE_INDEX_SUFFIX!r}"
+    )
 
 
 def camera_spec(name: str) -> CameraSpec:
