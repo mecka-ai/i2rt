@@ -219,7 +219,29 @@ class DMSingleMotorCanInterface(CanInterface):
         """
         id = self._get_frame_id(motor_id)
         data = [0xFF] * 7 + [0xFD]
-        message = self._send_message_get_response(id, motor_id, data)
+        self._send_message_get_response(id, motor_id, data)
+
+    def emergency_motor_off(self, motor_id: int) -> None:
+        """Best-effort motor-off command for emergency-stop paths.
+
+        This sends the special motor-off frame without waiting for a response so
+        all motors can be commanded off quickly even if one motor is already
+        unresponsive.
+        """
+        data = [0xFF] * 7 + [0xFD]
+        frame_ids = [motor_id]
+        offset_id = self._get_frame_id(motor_id)
+        if offset_id != motor_id:
+            frame_ids.append(offset_id)
+        errors: list[BaseException] = []
+        for frame_id in frame_ids:
+            try:
+                self.bus.send(can.Message(arbitration_id=frame_id, data=data, is_extended_id=False))
+            except Exception as exc:
+                errors.append(exc)
+                logging.warning(f"failed to send emergency motor-off frame id={frame_id}: {exc}")
+        if len(errors) == len(frame_ids):
+            raise errors[-1]
 
     def save_zero_position(self, motor_id: int) -> None:
         """Save the current position as zero position.
@@ -463,6 +485,10 @@ class MotorChain(Protocol):
 
     def set_profile_limits(self, max_velocity: float, acceleration: float) -> None:
         """Set onboard position profile limits for all motors in the chain."""
+        raise NotImplementedError
+
+    def emergency_stop(self) -> None:
+        """Immediately command all motors off."""
         raise NotImplementedError
 
 
@@ -862,6 +888,22 @@ class DMChainCanInterface(MotorChain):
         with self.same_bus_device_lock:
             return self.same_bus_device_states
 
+    def emergency_stop(self) -> None:
+        self.running = False
+        errors: list[str] = []
+        with self.command_lock:
+            self.commands = [MotorCmd() for _ in self.motor_list]
+            for motor_id, _motor_type in self.motor_list:
+                try:
+                    self.motor_interface.emergency_motor_off(motor_id)
+                except Exception as exc:
+                    errors.append(f"{motor_id}: {exc}")
+        thread = getattr(self, "thread", None)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.0)
+        if errors:
+            raise RuntimeError("failed to stop motors: " + "; ".join(errors))
+
     def close(self) -> None:
         self.running = False
         thread = getattr(self, "thread", None)
@@ -926,6 +968,16 @@ class MultiDMChainCanInterface(MotorChain):
     def set_profile_limits(self, max_velocity: float, acceleration: float) -> None:
         for inter in self.interfaces:
             inter.set_profile_limits(max_velocity, acceleration)
+
+    def emergency_stop(self) -> None:
+        errors: list[str] = []
+        for inter in self.interfaces:
+            try:
+                inter.emergency_stop()
+            except Exception as exc:
+                errors.append(str(exc))
+        if errors:
+            raise RuntimeError("failed to stop one or more motor chains: " + "; ".join(errors))
 
 
 if __name__ == "__main__":

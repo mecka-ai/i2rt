@@ -582,6 +582,17 @@ class MotorChainRobot(Robot):
             self._kp = np.zeros(len(self.motor_chain))
             self._kd = np.zeros(len(self.motor_chain))
 
+    def emergency_stop(self) -> None:
+        """Stop the control loop and command every motor off."""
+        logging.warning(f"Emergency stop requested for {self}")
+        self._stop_event.set()
+        with self._command_lock:
+            self._commands = JointCommands.init_all_zero(len(self.motor_chain))
+            self._clip_motor_torque = 0.0
+        self.motor_chain.emergency_stop()
+        if threading.current_thread() is not self._server_thread and self._server_thread.is_alive():
+            self._server_thread.join(timeout=1.0)
+
     def get_observations(self) -> Dict[str, np.ndarray]:
         """Get the current observations of the robot.
 
@@ -633,7 +644,8 @@ class MotorChainRobot(Robot):
         """Safely close the robot by setting all torques to zero."""
         # self.move_to_zero()
         self._stop_event.set()  # Signal the thread to stop
-        self._server_thread.join()  # Wait for the thread to finish
+        if threading.current_thread() is not self._server_thread:
+            self._server_thread.join()  # Wait for the thread to finish
         self.motor_chain.close()
         print("Robot closed with all torques set to zero.")
 
