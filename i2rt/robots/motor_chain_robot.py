@@ -335,6 +335,9 @@ class MotorChainRobot(Robot):
 
             self.update()
             if not self.motor_chain.running:
+                if self._stop_event.is_set():
+                    logging.info(f"{self}: robot server stopped by request")
+                    break
                 raise RuntimeError(f"{self}: motor_chain_robot's motor chain is not running, exiting the robot server")
             time.sleep(0.004)
 

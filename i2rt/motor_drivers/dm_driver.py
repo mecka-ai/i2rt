@@ -222,26 +222,9 @@ class DMSingleMotorCanInterface(CanInterface):
         self._send_message_get_response(id, motor_id, data)
 
     def emergency_motor_off(self, motor_id: int) -> None:
-        """Best-effort motor-off command for emergency-stop paths.
-
-        This sends the special motor-off frame without waiting for a response so
-        all motors can be commanded off quickly even if one motor is already
-        unresponsive.
-        """
+        """Send a motor-off frame without waiting for a response."""
         data = [0xFF] * 7 + [0xFD]
-        frame_ids = [motor_id]
-        offset_id = self._get_frame_id(motor_id)
-        if offset_id != motor_id:
-            frame_ids.append(offset_id)
-        errors: list[BaseException] = []
-        for frame_id in frame_ids:
-            try:
-                self.bus.send(can.Message(arbitration_id=frame_id, data=data, is_extended_id=False))
-            except Exception as exc:
-                errors.append(exc)
-                logging.warning(f"failed to send emergency motor-off frame id={frame_id}: {exc}")
-        if len(errors) == len(frame_ids):
-            raise errors[-1]
+        self.bus.send(can.Message(arbitration_id=motor_id, data=data, is_extended_id=False))
 
     def save_zero_position(self, motor_id: int) -> None:
         """Save the current position as zero position.
