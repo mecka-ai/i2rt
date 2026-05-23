@@ -15,6 +15,13 @@ uv pip install --python .venv/bin/python -e ../i2rt -e .
 .venv/bin/robot-control-server --host 0.0.0.0 --port 8765
 ```
 
+Over SSH, use a login shell and the explicit Radxa `uv` path:
+
+```bash
+ssh radxa@atlascm7660 'bash -lc "cd /home/radxa/elevator_detection/robot_control && UV=/home/radxa/.local/bin/uv && \$UV venv --allow-existing .venv && \$UV pip install --python .venv/bin/python -e ../i2rt -e ."'
+ssh radxa@atlascm7660 'bash -lc "cd /home/radxa/elevator_detection/robot_control && .venv/bin/robot-control-server --host 0.0.0.0 --port 8765"'
+```
+
 Then start Viser. Viser connects to `ws://127.0.0.1:8765`; it does not open
 CAN or the Nexus2 camera directly.
 

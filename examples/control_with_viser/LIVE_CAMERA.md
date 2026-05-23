@@ -29,8 +29,12 @@ caches, and bytecode are skipped. The CM5 runs the synced code from
 Create or refresh the robot-control environment:
 
 ```bash
-ssh radxa@atlascm7660 "cd /home/radxa/elevator_detection/robot_control && uv venv --allow-existing .venv && uv pip install --python .venv/bin/python -e ../i2rt -e ."
+ssh radxa@atlascm7660 'bash -lc "cd /home/radxa/elevator_detection/robot_control && UV=/home/radxa/.local/bin/uv && \$UV venv --allow-existing .venv && \$UV pip install --python .venv/bin/python -e ../i2rt -e ."'
 ```
+
+The `bash -lc` wrapper makes SSH load the login-shell environment. The explicit
+`/home/radxa/.local/bin/uv` path covers non-interactive shells where `uv` is not
+on `PATH`.
 
 Stop existing robot-control/viser processes:
 
@@ -41,13 +45,13 @@ ssh radxa@atlascm7660 "pkill -f '[r]obot_control.server' || true; pkill -f '[c]o
 Start the robot-control service:
 
 ```bash
-ssh radxa@atlascm7660 "cd /home/radxa/elevator_detection/robot_control && .venv/bin/robot-control-server --host 0.0.0.0 --port 8765"
+ssh radxa@atlascm7660 'bash -lc "cd /home/radxa/elevator_detection/robot_control && .venv/bin/robot-control-server --host 0.0.0.0 --port 8765"'
 ```
 
 In a second shell, run Viser on the CM5:
 
 ```bash
-ssh radxa@atlascm7660 "cd /home/radxa/elevator_detection/robot_control && .venv/bin/yam-viser"
+ssh radxa@atlascm7660 'bash -lc "cd /home/radxa/elevator_detection/robot_control && .venv/bin/yam-viser"'
 ```
 
 Or run Viser locally on the laptop:
