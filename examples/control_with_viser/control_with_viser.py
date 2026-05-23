@@ -1,4 +1,4 @@
-"""Start the YAM Viser UI on the CM5."""
+"""Start the YAM Viser UI as a client of robot_control.server."""
 
 # ruff: noqa: I001
 
@@ -7,14 +7,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from i2rt.robots.get_robot import get_yam_robot
-from i2rt.robots.utils import ArmType, GripperType
 from i2rt.utils.nexus_camera import hand_eye_calibration_path
 from i2rt.utils.viser_control_interface import ViserControlInterface
+from robot_control import RemoteCameraFeed, RobotClient
 
 
 PORT = 8080
-CHANNEL = "can0"
+ROBOT_CONTROL_URL = "ws://127.0.0.1:8765"
 CAMERA_MOUNT_FRAME = "geom_4_top"
 CAMERA_CALIBRATIONS = {
     "left": str(hand_eye_calibration_path("left")),
@@ -22,13 +21,8 @@ CAMERA_CALIBRATIONS = {
 }
 
 
-robot = get_yam_robot(
-    channel=CHANNEL,
-    arm_type=ArmType.YAM,
-    gripper_type=GripperType.NO_GRIPPER,
-    sim=False,
-    clip_motor_torque=2.0,
-)
+robot = RobotClient(ROBOT_CONTROL_URL)
+camera_feed = RemoteCameraFeed(ROBOT_CONTROL_URL)
 
 ViserControlInterface.from_robot(
     robot,
@@ -36,4 +30,5 @@ ViserControlInterface.from_robot(
     port=PORT,
     camera_calibrations=CAMERA_CALIBRATIONS,
     camera_mount_frame=CAMERA_MOUNT_FRAME,
+    camera_feed=camera_feed,
 ).run()

@@ -65,6 +65,7 @@ class ViserControlInterface:
         dt: float = 0.02,
         port: int = 8080,
         camera_mount_frame: str = "geom_4_top",
+        camera_feed: Any | None = None,
     ) -> None:
         self._robot = robot
         self._ee_site = ee_site
@@ -72,7 +73,8 @@ class ViserControlInterface:
         self._port = port
         self._camera_mount_frame = camera_mount_frame
         self._camera_calibrations = self._load_camera_calibrations(camera_calibrations, camera_mount_frame)
-        self._camera_feed = NexusCamera(
+        self._owns_camera_feed = camera_feed is None
+        self._camera_feed = camera_feed or NexusCamera(
             cameras=CAMERAS.keys(),
             models={name: calibration["camera_model"] for name, calibration in self._camera_calibrations.items()},
             start_thread=True,
@@ -92,8 +94,8 @@ class ViserControlInterface:
 
         info: Dict[str, Any] = robot.get_robot_info()
         n = robot.num_dofs()
-        self._kp: np.ndarray = info.get("kp", np.full(n, 10.0)).copy()
-        self._kd: np.ndarray = info.get("kd", np.full(n, 1.0)).copy()
+        self._kp: np.ndarray = np.asarray(info.get("kp", np.full(n, 10.0)), dtype=float).copy()
+        self._kd: np.ndarray = np.asarray(info.get("kd", np.full(n, 1.0)), dtype=float).copy()
         self._gain_scale = 1.0
         self._gripper_index: Optional[int] = info.get("gripper_index")
         self._gripper_limits: Optional[np.ndarray] = info.get("gripper_limits")
@@ -112,12 +114,13 @@ class ViserControlInterface:
     @classmethod
     def from_robot(
         cls,
-        robot: MotorChainRobot,
+        robot: Robot,
         camera_calibrations: Dict[str, str],
         ee_site: str = "grasp_site",
         dt: float = 0.02,
         port: int = 8080,
         camera_mount_frame: str = "geom_4_top",
+        camera_feed: Any | None = None,
     ) -> "ViserControlInterface":
         return cls(
             robot,
@@ -127,6 +130,7 @@ class ViserControlInterface:
             dt,
             port,
             camera_mount_frame=camera_mount_frame,
+            camera_feed=camera_feed,
         )
 
     # ---- MuJoCo helpers -------------------------------------------------------
@@ -197,7 +201,8 @@ class ViserControlInterface:
         """Restore grav-comp on returning to VIS."""
         if isinstance(self._robot, MotorChainRobot) and self._robot.get_motor_control_mode() == ControlMode.POS_VEL:
             return
-        self._robot.enter_gravity_comp_idle()
+        if hasattr(self._robot, "enter_gravity_comp_idle"):
+            self._robot.enter_gravity_comp_idle()
 
     def _enter_control_grav_comp(self) -> None:
         """CONTROL mode switches to PD on the next command."""
@@ -205,7 +210,8 @@ class ViserControlInterface:
         self._in_collision = False
 
     def _apply_scaled_gains(self) -> None:
-        self._robot.update_kp_kd(self._kp * self._gain_scale, self._kd * self._gain_scale)
+        if hasattr(self._robot, "update_kp_kd"):
+            self._robot.update_kp_kd(self._kp * self._gain_scale, self._kd * self._gain_scale)
 
     @staticmethod
     def _mat3_to_wxyz(mat3: np.ndarray) -> np.ndarray:
@@ -431,8 +437,12 @@ class ViserControlInterface:
 
         n_dofs = self._robot.num_dofs()
         info: Dict[str, Any] = self._robot.get_robot_info()
-        has_kpkd = "kp" in info
-        has_profile_control = isinstance(self._robot, MotorChainRobot) and not self._is_sim
+        has_kpkd = "kp" in info and hasattr(self._robot, "update_kp_kd")
+        has_profile_control = (
+            hasattr(self._robot, "set_motor_control_mode")
+            and hasattr(self._robot, "set_profile_limits")
+            and not self._is_sim
+        )
 
         # ---- GUI — safety gate -----------------------------------------------
         with server.gui.add_folder("Safety"):
@@ -502,7 +512,7 @@ class ViserControlInterface:
             )
             camera_sidebar_image = server.gui.add_image(
                 self._camera_feed.latest_full_rgb(),
-                label="video2 full frame",
+                label="Nexus2 full frame",
                 format="jpeg",
                 jpeg_quality=70,
             )
@@ -789,17 +799,22 @@ class ViserControlInterface:
                     target[:3, 3] = np.asarray(ik_ctrl.position)
                     target[:3, :3] = self._wxyz_to_mat3(np.asarray(ik_ctrl.wxyz))
                     init_q = self._data.qpos[: self._nq].copy()
-                    _, ik_q = self._kin.ik(target, self._ee_site, init_q=init_q)
+                    if hasattr(self._robot, "solve_ik"):
+                        ik_result = self._robot.solve_ik(target, init_q=init_q, site=self._ee_site)
+                        ik_success = bool(ik_result.get("success"))
+                        ik_q = np.asarray(ik_result["joint_pos"], dtype=float)
+                    else:
+                        ik_success, ik_q = self._kin.ik(target, self._ee_site, init_q=init_q)
                     cmd = self._robot.get_joint_pos().copy()
                     cmd[: self._n_arm] = ik_q[: self._n_arm]
                     if gripper_slider is not None and self._gripper_index is not None:
                         cmd[self._gripper_index] = float(gripper_slider.value)
                     n = min(len(cmd), self._nq)
-                    if self._has_self_collision(cmd, n):
+                    if ik_success and self._has_self_collision(cmd, n):
                         if not self._in_collision:
                             print("[viser] Collision detected — command blocked")
                             self._in_collision = True
-                    else:
+                    elif ik_success:
                         self._robot.command_joint_pos(cmd)
                         if self._in_collision:
                             print("[viser] Collision cleared — commands resumed")
@@ -833,6 +848,6 @@ class ViserControlInterface:
         except KeyboardInterrupt:
             pass
 
-        if self._camera_feed is not None:
+        if self._camera_feed is not None and self._owns_camera_feed:
             self._camera_feed.close()
         print("[viser] Stopped")

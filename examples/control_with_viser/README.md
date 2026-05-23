@@ -6,15 +6,19 @@ Browser-based 3D visualization and control interface for i2rt robots, powered by
 
 ## Quick Start
 
+Start the robot-side owner first:
+
 ```bash
-# Simulation mode (no hardware required)
-python examples/control_with_viser/control_with_viser.py --sim
+cd /home/radxa/elevator_detection/robot_control
+../.venv/bin/python -m robot_control.server --host 0.0.0.0 --port 8765
+```
 
-# Real robot on CAN bus
-python examples/control_with_viser/control_with_viser.py --channel can0
+Then start Viser. Viser connects to `ws://127.0.0.1:8765`; it does not open
+CAN or the Nexus2 camera directly.
 
-# Specify arm and gripper variants
-python examples/control_with_viser/control_with_viser.py --arm big_yam --gripper linear_4310 --sim
+```bash
+cd /home/radxa/elevator_detection/i2rt
+../.venv/bin/python examples/control_with_viser/control_with_viser.py
 ```
 
 Then open `http://localhost:8080` in your browser.
@@ -43,14 +47,8 @@ Drag the 6-DOF transform gizmo to command the end-effector pose. An inverse kine
 
 Directly control each joint angle (in degrees) and the gripper position using individual sliders. Changes are sent to the robot immediately each loop iteration. This mode is useful for precise per-joint positioning and testing range of motion.
 
-## Options
+## Configuration
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--arm` | `yam` | Arm variant (`yam`, `yam_pro`, `yam_ultra`, `big_yam`) |
-| `--gripper` | `linear_4310` | Gripper type (`linear_4310`, `linear_3507`, `crank_4310`, `no_gripper`, `yam_teaching_handle`) |
-| `--channel` | `can0` | CAN interface name (ignored in sim mode) |
-| `--sim` | off | Use simulated robot instead of real hardware |
-| `--dt` | `0.02` | Control loop timestep in seconds |
-| `--port` | `8080` | Viser server port |
-| `--site` | auto | End-effector site name (auto-detected from gripper type) |
+The current example is fixed to the deployed YAM + no-gripper setup and the
+local robot-control service URL. Change `ROBOT_CONTROL_URL` in
+`control_with_viser.py` if Viser is running on a different host.

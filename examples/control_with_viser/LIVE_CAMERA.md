@@ -1,6 +1,9 @@
-# Live Camera Viser Deploy
+# Robot-Control Viser Deploy
 
-This setup lets `control_with_viser.py` open `/dev/video2` directly through `i2rt.utils.nexus_camera`. The Camera panel shows the full Nexus2 frame, and each calibrated 3D frustum asks that shared camera object for its own cropped, undistorted frame.
+This setup runs one robot-side owner, `robot_control.server`, which opens CAN
+and the Nexus2 camera through `i2rt.utils.nexus_camera`. Viser connects as a
+WebSocket client. The Camera panel shows the full Nexus2 frame streamed from
+the service, and each calibrated 3D frustum uses its own rectified JPEG stream.
 
 Camera intrinsics come from the synced repo data:
 
@@ -20,13 +23,19 @@ rsync -a --filter=':- .gitignore' --exclude='.git/' --exclude='.venv/' --exclude
 
 This copies the whole repo while respecting `.gitignore`, so local virtualenvs, caches, and bytecode are skipped. The CM5 runs the synced code from `/home/radxa/elevator_detection` using the canonical environment at `/home/radxa/elevator_detection/.venv/bin/python`.
 
-Stop existing camera/viser processes:
+Stop existing robot-control/viser processes:
 
 ```bash
-ssh radxa@atlascm7660 "pkill -f '[c]ontrol_with_viser.py' || true; pkill -f '[c]am_server.py' || true"
+ssh radxa@atlascm7660 "pkill -f '[r]obot_control.server' || true; pkill -f '[c]ontrol_with_viser.py' || true"
 ```
 
-Run viser from the laptop:
+Start the robot-control service:
+
+```bash
+ssh radxa@atlascm7660 "cd /home/radxa/elevator_detection/robot_control && ../.venv/bin/python -u -m robot_control.server --host 0.0.0.0 --port 8765"
+```
+
+In a second shell, run Viser:
 
 ```bash
 ssh radxa@atlascm7660 "cd /home/radxa/elevator_detection/i2rt && ../.venv/bin/python -u examples/control_with_viser/control_with_viser.py"
@@ -38,7 +47,9 @@ Open:
 http://atlascm7660:8080/
 ```
 
-The old camera server is intentionally stopped. Viser owns `/dev/video2`, then passes the live images through its own UI so the sidebar and frustum do not depend on a second browser-visible port.
+No separate browser-visible camera server is needed. Viser never opens the
+camera device; it receives `full`, `left_rectified`, and `right_rectified`
+JPEG streams from `robot_control.server`.
 
 Hand-eye calibration outputs are discovered from:
 
