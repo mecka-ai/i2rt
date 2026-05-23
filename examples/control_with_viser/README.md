@@ -10,23 +10,26 @@ Start the robot-side owner first:
 
 ```bash
 cd /home/radxa/elevator_detection/robot_control
-../.venv/bin/python -m robot_control.server --host 0.0.0.0 --port 8765
+uv venv --allow-existing .venv
+uv pip install --python .venv/bin/python -e ../i2rt -e .
+.venv/bin/robot-control-server --host 0.0.0.0 --port 8765
 ```
 
 Then start Viser. Viser connects to `ws://127.0.0.1:8765`; it does not open
 CAN or the Nexus2 camera directly.
 
 ```bash
-cd /home/radxa/elevator_detection/i2rt
-../.venv/bin/python examples/control_with_viser/control_with_viser.py
+cd /home/radxa/elevator_detection/robot_control
+.venv/bin/yam-viser
 ```
 
 To run Viser locally on a laptop while the robot service runs on the CM5:
 
 ```bash
-cd /Users/theol/Documents/github/elevator_detection/i2rt
-PYTHONPATH=../robot_control/src:. uv run python examples/control_with_viser/control_with_viser.py \
-  --robot-control-url ws://atlascm7660:8765
+cd /Users/theol/Documents/github/elevator_detection/robot_control
+uv venv --allow-existing .venv
+uv pip install --python .venv/bin/python -e ../i2rt -e .
+.venv/bin/yam-viser --robot-control-url ws://atlascm7660:8765
 ```
 
 On the CM5, open `http://atlascm7660:8080` from your laptop. When Viser is

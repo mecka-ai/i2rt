@@ -21,7 +21,16 @@ cd /Users/theol/Documents/github/elevator_detection
 rsync -a --filter=':- .gitignore' --exclude='.git/' --exclude='.venv/' --exclude='*/.venv/' --stats ./ radxa@atlascm7660:/home/radxa/elevator_detection/
 ```
 
-This copies the whole repo while respecting `.gitignore`, so local virtualenvs, caches, and bytecode are skipped. The CM5 runs the synced code from `/home/radxa/elevator_detection` using the canonical environment at `/home/radxa/elevator_detection/.venv/bin/python`.
+This copies the whole repo while respecting `.gitignore`, so local virtualenvs,
+caches, and bytecode are skipped. The CM5 runs the synced code from
+`/home/radxa/elevator_detection` using the canonical environment at
+`/home/radxa/elevator_detection/robot_control/.venv`.
+
+Create or refresh the robot-control environment:
+
+```bash
+ssh radxa@atlascm7660 "cd /home/radxa/elevator_detection/robot_control && uv venv --allow-existing .venv && uv pip install --python .venv/bin/python -e ../i2rt -e ."
+```
 
 Stop existing robot-control/viser processes:
 
@@ -32,21 +41,22 @@ ssh radxa@atlascm7660 "pkill -f '[r]obot_control.server' || true; pkill -f '[c]o
 Start the robot-control service:
 
 ```bash
-ssh radxa@atlascm7660 "cd /home/radxa/elevator_detection/robot_control && ../.venv/bin/python -u -m robot_control.server --host 0.0.0.0 --port 8765"
+ssh radxa@atlascm7660 "cd /home/radxa/elevator_detection/robot_control && .venv/bin/robot-control-server --host 0.0.0.0 --port 8765"
 ```
 
 In a second shell, run Viser on the CM5:
 
 ```bash
-ssh radxa@atlascm7660 "cd /home/radxa/elevator_detection/i2rt && ../.venv/bin/python -u examples/control_with_viser/control_with_viser.py"
+ssh radxa@atlascm7660 "cd /home/radxa/elevator_detection/robot_control && .venv/bin/yam-viser"
 ```
 
 Or run Viser locally on the laptop:
 
 ```bash
-cd /Users/theol/Documents/github/elevator_detection/i2rt
-PYTHONPATH=../robot_control/src:. uv run python examples/control_with_viser/control_with_viser.py \
-  --robot-control-url ws://atlascm7660:8765
+cd /Users/theol/Documents/github/elevator_detection/robot_control
+uv venv --allow-existing .venv
+uv pip install --python .venv/bin/python -e ../i2rt -e .
+.venv/bin/yam-viser --robot-control-url ws://atlascm7660:8765
 ```
 
 Open:
@@ -58,7 +68,21 @@ http://atlascm7660:8080/    # CM5 Viser
 
 No separate browser-visible camera server is needed. Viser never opens the
 camera device; it receives `full`, `left_rectified`, and `right_rectified`
-JPEG streams from `robot_control.server`.
+JPEG streams from `robot_control.server`. The Camera panel's `Detection boxes`
+toggle switches the left/right frustums to `left_detections_overlay` and
+`right_detections_overlay`; RF-DETR medium inference starts only while those
+overlay streams or raw detection streams are subscribed.
+
+Raw detection JSON is available over the same WebSocket server:
+
+```python
+from robot_control import RobotClient
+
+client = RobotClient("ws://atlascm7660:8765")
+print(client.get_detections("right"))
+for payload in client.stream_detections("left"):
+    print(payload["detections"])
+```
 
 Hand-eye calibration outputs are discovered from:
 
