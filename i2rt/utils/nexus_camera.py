@@ -188,6 +188,10 @@ class NexusCamera:
         image = camera_spec(camera).crop(frame)
         return timestamp, image
 
+    def read_cameras(self, flush_frames: int = 1) -> tuple[float, dict[str, np.ndarray]]:
+        timestamp, frame = self.read_full(flush_frames)
+        return timestamp, {name: camera_spec(name).crop(frame) for name in self._cameras}
+
     def latest_full_rgb(self) -> np.ndarray:
         with self._lock:
             assert self._latest_full_rgb is not None
