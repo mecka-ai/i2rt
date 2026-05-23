@@ -503,6 +503,7 @@ class ViserControlInterface:
                 step=0.01,
                 initial_value=_DEFAULT_FRUSTUM_SCALE,
             )
+            detection_overlay_cb = server.gui.add_checkbox("Detection boxes", initial_value=False)
             camera_sidebar_image = server.gui.add_image(
                 self._camera_feed.latest_full_rgb(),
                 label="Nexus2 full frame",
@@ -712,6 +713,10 @@ class ViserControlInterface:
             self._gain_scale = float(gain_scale_slider.value)
             self._apply_scaled_gains()
 
+        @detection_overlay_cb.on_update
+        def _(_: object) -> None:
+            self._camera_feed.set_detection_overlay(bool(detection_overlay_cb.value))
+
         # ---- Main loop -------------------------------------------------------
         prev_controlled = False
         try:
@@ -740,7 +745,7 @@ class ViserControlInterface:
                     frustum.wxyz = self._mat3_to_wxyz(T_camera[:3, :3])
                     if frustum_scale_slider is not None:
                         frustum.scale = frustum_scale_slider.value
-                    frustum.image = self._camera_feed.latest_rgb(camera)
+                    frustum.image = self._camera_feed.latest_rgb(camera, detections=bool(detection_overlay_cb.value))
                 camera_sidebar_image.image = self._camera_feed.latest_full_rgb()
 
                 if self._with_teaching_handle:
