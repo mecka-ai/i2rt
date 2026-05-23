@@ -7,6 +7,7 @@ import numpy as np
 
 from i2rt.motor_drivers.dm_driver import (
     CanInterface,
+    ControlMode,
     DMChainCanInterface,
     EncoderChain,
     PassiveEncoderReader,
@@ -62,6 +63,9 @@ def _get_gripper_only_robot(
     channel: str = "can0",
     gripper_type: GripperType = GripperType.LINEAR_4310,
     sim: bool = False,
+    control_mode: str = ControlMode.MIT,
+    profile_max_velocity: float = 0.5,
+    profile_acceleration: float = 1.0,
 ) -> "Robot":
     """Create a gripper-only robot (no arm).
 
@@ -69,6 +73,9 @@ def _get_gripper_only_robot(
         channel: CAN interface name (e.g. "can0"). Ignored in sim mode.
         gripper_type: Which gripper to load. Must not be NO_GRIPPER.
         sim: If True, return a SimRobot instead of connecting to real hardware.
+        control_mode: Runtime motor command mode.
+        profile_max_velocity: POS_VEL maximum speed.
+        profile_acceleration: POS_VEL acceleration magnitude.
     """
     if gripper_type == GripperType.NO_GRIPPER:
         raise ValueError("gripper_type cannot be NO_GRIPPER when arm_type is NO_ARM")
@@ -107,10 +114,12 @@ def _get_gripper_only_robot(
         channel,
         motor_chain_name="gripper_only",
         receive_mode=ReceiveMode.p16,
-        start_thread=True,
+        control_mode=ControlMode.MIT,
+        start_thread=False,
     )
+    motor_chain.start_thread()
 
-    return MotorChainRobot(
+    robot = MotorChainRobot(
         motor_chain=motor_chain,
         xml_path=xml_path,
         use_gravity_comp=False,
@@ -123,7 +132,12 @@ def _get_gripper_only_robot(
         gripper_type=gripper_type,
         arm_type=nominal_arm,
         zero_gravity_mode=False,
+        profile_max_velocity=profile_max_velocity,
+        profile_acceleration=profile_acceleration,
     )
+    if control_mode != ControlMode.MIT:
+        robot.set_motor_control_mode(control_mode)
+    return robot
 
 
 def get_yam_robot(
@@ -141,6 +155,9 @@ def get_yam_robot(
     sim: bool = False,
     joint_state_saver_factory: Optional[Callable[[], Any]] = None,
     set_realtime_and_pin_callback: Optional[Callable[[int], None]] = None,
+    control_mode: str = ControlMode.MIT,
+    profile_max_velocity: float = 0.5,
+    profile_acceleration: float = 1.0,
 ) -> "Robot":
     """Create a YAM-family robot (real or sim).
 
@@ -157,10 +174,20 @@ def get_yam_robot(
         gripper_kp: Optional gripper kp override. Defaults to gripper_type's default.
         gripper_kd: Optional gripper kd override. Defaults to gripper_type's default.
         sim: If True, return a SimRobot instead of connecting to real hardware.
+        control_mode: Runtime motor command mode. Defaults to MIT. POS_VEL uses onboard profiled moves.
+        profile_max_velocity: POS_VEL maximum speed in rad/s.
+        profile_acceleration: POS_VEL acceleration magnitude in rad/s^2.
     """
     # --- Gripper-only path (no arm) -------------------------------------------
     if arm_type == ArmType.NO_ARM:
-        return _get_gripper_only_robot(channel=channel, gripper_type=gripper_type, sim=sim)
+        return _get_gripper_only_robot(
+            channel=channel,
+            gripper_type=gripper_type,
+            sim=sim,
+            control_mode=control_mode,
+            profile_max_velocity=profile_max_velocity,
+            profile_acceleration=profile_acceleration,
+        )
 
     with_gripper = gripper_type not in (GripperType.YAM_TEACHING_HANDLE, GripperType.NO_GRIPPER)
     with_teaching_handle = gripper_type == GripperType.YAM_TEACHING_HANDLE
@@ -243,6 +270,7 @@ def get_yam_robot(
         channel,
         motor_chain_name="yam_real",
         receive_mode=ReceiveMode.p16,
+        control_mode=ControlMode.MIT,
         start_thread=False,
         get_same_bus_device_driver=get_encoder_chain if with_teaching_handle else None,
         use_buffered_reader=False,
@@ -280,10 +308,12 @@ def get_yam_robot(
         clip_motor_torque=clip_motor_torque,
         joint_state_saver_factory=joint_state_saver_factory,
         set_realtime_and_pin_callback=set_realtime_and_pin_callback,
+        profile_max_velocity=profile_max_velocity,
+        profile_acceleration=profile_acceleration,
     )
 
     if with_gripper:
-        return get_robot(
+        robot = get_robot(
             gripper_index=n_arm_joints,
             gripper_limits=gripper_limits,
             enable_gripper_calibration=gripper_needs_cal,
@@ -291,4 +321,8 @@ def get_yam_robot(
             arm_type=arm_type,
             limit_gripper_force=50.0,
         )
-    return get_robot()
+    else:
+        robot = get_robot()
+    if control_mode != ControlMode.MIT:
+        robot.set_motor_control_mode(control_mode)
+    return robot

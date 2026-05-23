@@ -1,5 +1,7 @@
 """Start the YAM Viser UI on the CM5."""
 
+# ruff: noqa: I001
+
 import sys
 from pathlib import Path
 

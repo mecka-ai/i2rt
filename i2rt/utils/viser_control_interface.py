@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional
 import mujoco
 import numpy as np
 
-from i2rt.motor_drivers.dm_driver import PassiveEncoderInfo
+from i2rt.motor_drivers.dm_driver import ControlMode, PassiveEncoderInfo
 from i2rt.robots.kinematics import Kinematics
 from i2rt.robots.motor_chain_robot import MotorChainRobot
 from i2rt.robots.robot import Robot
@@ -42,6 +42,8 @@ _CAMERA_MOUNT_BODY_ID = 4
 _CAMERA_MOUNT_OFFSET_LOCAL = np.array([-0.11963644, 0.04517079, -0.03549660])
 _DEFAULT_FRUSTUM_SCALE = 0.12
 _SAFE_TORQUE_LIMIT_NM = 2.0
+_DEFAULT_PROFILE_MAX_VELOCITY = 0.5
+_DEFAULT_PROFILE_ACCELERATION = 1.0
 
 
 class ViserControlInterface:
@@ -191,6 +193,8 @@ class ViserControlInterface:
 
     def _enter_vis_grav_comp(self) -> None:
         """Restore grav-comp on returning to VIS."""
+        if isinstance(self._robot, MotorChainRobot) and self._robot.get_motor_control_mode() == ControlMode.POS_VEL:
+            return
         self._robot.enter_gravity_comp_idle()
 
     def _enter_control_grav_comp(self) -> None:
@@ -418,11 +422,15 @@ class ViserControlInterface:
                 )
 
         # ---- Shared mutable state (read by loop, written by callbacks) --------
-        state: Dict[str, Any] = {"enabled": False, "mode": "vis"}
+        state: Dict[str, Any] = {
+            "enabled": False,
+            "mode": "vis",
+        }
 
         n_dofs = self._robot.num_dofs()
         info: Dict[str, Any] = self._robot.get_robot_info()
         has_kpkd = "kp" in info
+        has_profile_control = isinstance(self._robot, MotorChainRobot) and not self._is_sim
 
         # ---- GUI — safety gate -----------------------------------------------
         with server.gui.add_folder("Safety"):
@@ -446,6 +454,33 @@ class ViserControlInterface:
                 step=0.05,
                 initial_value=self._gain_scale,
             )
+
+        # ---- GUI — motor command mode ----------------------------------------
+        with server.gui.add_folder("Motor Profile"):
+            motor_mode_dd = server.gui.add_dropdown(
+                "Motor command",
+                options=["MIT + gravity comp", "POS-VEL profile"],
+                initial_value="POS-VEL profile"
+                if info.get("control_mode", ControlMode.MIT) == ControlMode.POS_VEL
+                else "MIT + gravity comp",
+            )
+            profile_velocity_slider = server.gui.add_slider(
+                "Max velocity (rad/s)",
+                min=0.05,
+                max=2.0,
+                step=0.05,
+                initial_value=float(info.get("profile_max_velocity", _DEFAULT_PROFILE_MAX_VELOCITY)),
+            )
+            profile_accel_slider = server.gui.add_slider(
+                "Accel (rad/s^2)",
+                min=0.1,
+                max=5.0,
+                step=0.1,
+                initial_value=float(info.get("profile_acceleration", _DEFAULT_PROFILE_ACCELERATION)),
+            )
+            motor_mode_dd.disabled = True
+            profile_velocity_slider.disabled = True
+            profile_accel_slider.disabled = True
 
         # ---- GUI — camera feed -----------------------------------------------
         with server.gui.add_folder("Camera"):
@@ -523,6 +558,21 @@ class ViserControlInterface:
 
         # ---- Callbacks -------------------------------------------------------
 
+        def _selected_motor_mode() -> str:
+            return ControlMode.POS_VEL if motor_mode_dd.value == "POS-VEL profile" else ControlMode.MIT
+
+        def _set_profile_widgets_enabled() -> None:
+            supported = has_profile_control and state["enabled"]
+            motor_mode_dd.disabled = not supported
+            profile_enabled = supported and _selected_motor_mode() == ControlMode.POS_VEL
+            profile_velocity_slider.disabled = not profile_enabled
+            profile_accel_slider.disabled = not profile_enabled
+
+        def _apply_profile_limits() -> None:
+            if not has_profile_control:
+                return
+            self._robot.set_profile_limits(float(profile_velocity_slider.value), float(profile_accel_slider.value))
+
         @align_cb.on_update
         def _(_: object) -> None:
             enable_btn.disabled = not align_cb.value
@@ -534,6 +584,7 @@ class ViserControlInterface:
             enable_btn.disabled = True
             status_md.content = "**Status:** ENABLED"
             mode_dd.disabled = False
+            _set_profile_widgets_enabled()
             print("[viser] Robot ENABLED — control active")
             # Sync sliders to current robot positions on enable
             q = self._robot.get_joint_pos()
@@ -554,6 +605,7 @@ class ViserControlInterface:
                     s.disabled = True
                 if gripper_slider is not None:
                     gripper_slider.disabled = True
+                _set_profile_widgets_enabled()
             elif sel == "IK control":
                 state["mode"] = "ik"
                 ik_ctrl.visible = True
@@ -569,6 +621,7 @@ class ViserControlInterface:
                 if gripper_slider is not None and self._gripper_index is not None:
                     q = self._robot.get_joint_pos()
                     gripper_slider.value = float(q[self._gripper_index])
+                _set_profile_widgets_enabled()
             elif sel == "Joint sliders":
                 state["mode"] = "joint"
                 ik_ctrl.visible = False
@@ -583,6 +636,29 @@ class ViserControlInterface:
                         s.value = float(np.degrees(q[i]))
                 if gripper_slider is not None and self._gripper_index is not None:
                     gripper_slider.value = float(q[self._gripper_index])
+                _set_profile_widgets_enabled()
+
+        @motor_mode_dd.on_update
+        def _(_: object) -> None:
+            if not has_profile_control:
+                _set_profile_widgets_enabled()
+                return
+            selected = _selected_motor_mode()
+            self._robot.set_motor_control_mode(selected)
+            if selected == ControlMode.POS_VEL:
+                _apply_profile_limits()
+            elif not (state["enabled"] and state["mode"] in ("ik", "joint")):
+                self._enter_vis_grav_comp()
+            print(f"[viser] Motor command mode set to {selected}")
+            _set_profile_widgets_enabled()
+
+        @profile_velocity_slider.on_update
+        def _(_: object) -> None:
+            _apply_profile_limits()
+
+        @profile_accel_slider.on_update
+        def _(_: object) -> None:
+            _apply_profile_limits()
 
         if apply_btn is not None:
 

@@ -1,0 +1,212 @@
+import struct
+import time
+from typing import Any
+
+import can
+import numpy as np
+import pytest
+
+from i2rt.motor_drivers.dm_driver import ControlMode, DMChainCanInterface, DMSingleMotorCanInterface, MotorRegister
+from i2rt.motor_drivers.utils import FeedbackFrameInfo, MotorInfo, MotorType
+from i2rt.robots.motor_chain_robot import MotorChainRobot
+
+
+def _feedback() -> FeedbackFrameInfo:
+    return FeedbackFrameInfo(
+        id=4,
+        error_code="0x1",
+        error_message="normal",
+        position=0.0,
+        velocity=0.0,
+        torque=0.0,
+        temperature_mos=30.0,
+        temperature_rotor=30.0,
+    )
+
+
+def test_pos_vel_control_packet_uses_profile_frame() -> None:
+    iface = DMSingleMotorCanInterface.__new__(DMSingleMotorCanInterface)
+    iface.control_mode = ControlMode.POS_VEL
+    iface.cmd_idoffset = ControlMode.get_id_offset(ControlMode.POS_VEL)
+    sent: dict[str, Any] = {}
+
+    def send(
+        frame_id: int,
+        motor_id: int,
+        data: bytearray,
+        max_retry: int = 15,
+    ) -> can.Message:
+        sent["frame_id"] = frame_id
+        sent["motor_id"] = motor_id
+        sent["data"] = bytes(data)
+        sent["max_retry"] = max_retry
+        return can.Message(arbitration_id=motor_id + 16, data=bytearray(8), is_extended_id=False)
+
+    iface._send_message_get_response = send
+    iface.parse_recv_message = lambda message, motor_type: _feedback()
+
+    iface.set_control(0x04, MotorType.DM4340, pos=1.25, vel=-0.5, kp=80.0, kd=5.0, torque=3.0)
+
+    assert sent["frame_id"] == 0x104
+    assert sent["motor_id"] == 0x04
+    assert sent["data"] == struct.pack("<ff", 1.25, 0.5)
+    assert sent["max_retry"] == 15
+
+
+def test_motor_register_writes_match_damiao_format() -> None:
+    iface = DMSingleMotorCanInterface.__new__(DMSingleMotorCanInterface)
+    messages: list[can.Message] = []
+    ack_reads = 0
+
+    class Bus:
+        pending_ack = False
+
+        def send(self, message: can.Message) -> None:
+            self.pending_ack = True
+            messages.append(message)
+
+        def recv(self, timeout: float = 0.001) -> can.Message | None:
+            nonlocal ack_reads
+            if not self.pending_ack:
+                return None
+            self.pending_ack = False
+            ack_reads += 1
+            return can.Message(
+                arbitration_id=0x7FF,
+                data=bytearray(messages[-1].data),
+                is_extended_id=False,
+            )
+
+    iface.bus = Bus()
+    iface.use_buffered_reader = False
+
+    iface.switch_control_mode(0x04, ControlMode.POS_VEL)
+    iface.set_profile_limits(0x04, max_velocity=0.5, acceleration=1.0)
+
+    assert [msg.arbitration_id for msg in messages] == [0x7FF, 0x7FF, 0x7FF, 0x7FF]
+    assert ack_reads == 4
+    assert bytes(messages[0].data) == struct.pack("<HBBI", 0x04, 0x55, MotorRegister.CTRL_MODE, 2)
+    assert bytes(messages[1].data) == struct.pack("<HBBf", 0x04, 0x55, MotorRegister.ACC, 1.0)
+    assert bytes(messages[2].data) == struct.pack("<HBBf", 0x04, 0x55, MotorRegister.DEC, -1.0)
+    assert bytes(messages[3].data) == struct.pack("<HBBf", 0x04, 0x55, MotorRegister.MAX_SPD, 0.5)
+
+
+def test_motor_register_write_rejects_stale_ack() -> None:
+    iface = DMSingleMotorCanInterface.__new__(DMSingleMotorCanInterface)
+    messages: list[can.Message] = []
+
+    class Bus:
+        def send(self, message: can.Message) -> None:
+            messages.append(message)
+
+        def recv(self, timeout: float = 0.001) -> can.Message:
+            return can.Message(
+                arbitration_id=0x7FF,
+                data=bytearray([0x05, 0x00, 0x55, MotorRegister.CTRL_MODE, 0, 0, 0, 0]),
+                is_extended_id=False,
+            )
+
+    iface.bus = Bus()
+    iface.use_buffered_reader = False
+
+    with pytest.raises(AssertionError):
+        iface.switch_control_mode(0x04, ControlMode.POS_VEL)
+
+    assert len(messages) == 5
+
+
+def test_motor_chain_rejects_non_mit_startup_mode() -> None:
+    with pytest.raises(ValueError, match="must start in MIT"):
+        DMChainCanInterface(
+            motor_list=[(0x01, MotorType.DM4310)],
+            motor_offset=np.array([0.0]),
+            motor_direction=np.array([1.0]),
+            control_mode=ControlMode.POS_VEL,
+            start_thread=False,
+        )
+
+
+class FakeMotorChain:
+    def __init__(self) -> None:
+        self.mode = ControlMode.MIT
+        self.profile_limits: tuple[float, float] | None = None
+        self.last_command: dict[str, np.ndarray | None] | None = None
+        self.running = True
+
+    def __len__(self) -> int:
+        return 2
+
+    def read_states(self) -> list[MotorInfo]:
+        now = time.time()
+        return [
+            MotorInfo(id=1, error_code="0x1", pos=0.1, vel=0.0, eff=0.0, timestamp=now),
+            MotorInfo(id=2, error_code="0x1", pos=-0.2, vel=0.0, eff=0.0, timestamp=now),
+        ]
+
+    def set_commands(
+        self,
+        torques: np.ndarray,
+        pos: np.ndarray | None = None,
+        vel: np.ndarray | None = None,
+        kp: np.ndarray | None = None,
+        kd: np.ndarray | None = None,
+    ) -> list[MotorInfo]:
+        self.last_command = {
+            "torques": torques.copy(),
+            "pos": None if pos is None else pos.copy(),
+            "vel": None if vel is None else vel.copy(),
+            "kp": None if kp is None else kp.copy(),
+            "kd": None if kd is None else kd.copy(),
+        }
+        return self.read_states()
+
+    def set_control_mode(self, control_mode: str) -> None:
+        self.mode = control_mode
+
+    def get_control_mode(self) -> str:
+        return self.mode
+
+    def set_profile_limits(self, max_velocity: float, acceleration: float) -> None:
+        self.profile_limits = (max_velocity, acceleration)
+
+    def close(self) -> None:
+        self.running = False
+
+
+def test_robot_pos_vel_mode_uses_profile_velocity_in_position_commands() -> None:
+    chain = FakeMotorChain()
+    robot = MotorChainRobot(
+        motor_chain=chain,
+        xml_path=None,
+        use_gravity_comp=False,
+        kp=[1.0, 1.0],
+        kd=[0.1, 0.1],
+        joint_limits=np.array([[-1.0, 1.0], [-1.0, 1.0]]),
+        zero_gravity_mode=False,
+        profile_max_velocity=0.4,
+        profile_acceleration=0.8,
+    )
+
+    try:
+        robot.set_motor_control_mode(ControlMode.POS_VEL)
+        robot.command_joint_pos(np.array([0.3, -0.4]))
+
+        assert chain.mode == ControlMode.POS_VEL
+        assert chain.profile_limits == (0.4, 0.8)
+        with robot._command_lock:
+            np.testing.assert_allclose(robot._commands.pos, [0.3, -0.4])
+            np.testing.assert_allclose(robot._commands.vel, [0.4, 0.4])
+    finally:
+        robot.close()
+
+
+def test_robot_rejects_non_positive_profile_limits() -> None:
+    chain = FakeMotorChain()
+    with pytest.raises(ValueError):
+        MotorChainRobot(
+            motor_chain=chain,
+            xml_path=None,
+            use_gravity_comp=False,
+            joint_limits=np.array([[-1.0, 1.0], [-1.0, 1.0]]),
+            profile_max_velocity=0.0,
+        )

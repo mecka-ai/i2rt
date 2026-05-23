@@ -51,6 +51,24 @@ class ControlMode:
         else:
             raise ValueError(f"Control mode '{control_mode}' not recognized.")
 
+    @classmethod
+    def get_ctrl_mode_value(cls, control_mode: str) -> int:
+        if control_mode == cls.MIT:
+            return 1
+        elif control_mode == cls.POS_VEL:
+            return 2
+        elif control_mode == cls.VEL:
+            return 3
+        else:
+            raise ValueError(f"Control mode '{control_mode}' not recognized.")
+
+
+class MotorRegister:
+    ACC = 4
+    DEC = 5
+    MAX_SPD = 6
+    CTRL_MODE = 10
+
 
 ######### for passive encoder #########
 @dataclass
@@ -272,6 +290,11 @@ class DMSingleMotorCanInterface(CanInterface):
             # system will only response to vel command
             can_data = struct.pack("<f", vel)
             data[0:4] = can_data[0:4]
+        elif self.control_mode == ControlMode.POS_VEL:
+            can_data = struct.pack("<ff", pos, abs(vel))
+            data[0:8] = can_data[0:8]
+        else:
+            raise ValueError(f"Control mode '{self.control_mode}' not recognized.")
 
         # Send the CAN message
         message = self._send_message_get_response(frame_id, motor_id, data, max_retry=15)
@@ -334,6 +357,73 @@ class DMSingleMotorCanInterface(CanInterface):
             temperature_rotor=temperature_rotor,
         )
 
+    @staticmethod
+    def _is_register_response(
+        message: Optional[can.Message],
+        motor_id: int,
+        register_id: int,
+        value_bytes: bytes,
+    ) -> bool:
+        if message is None or len(message.data) < 4:
+            return False
+        response_motor_id = struct.unpack("<H", bytes(message.data[0:2]))[0]
+        return response_motor_id == motor_id and message.data[3] == register_id and bytes(message.data[4:8]) == value_bytes
+
+    def _receive_register_response(
+        self,
+        motor_id: int,
+        register_id: int,
+        value_bytes: bytes,
+        timeout: float = 0.01,
+    ) -> can.Message:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            message = self.try_receive_message(motor_id, timeout=0.001)
+            if self._is_register_response(message, motor_id, register_id, value_bytes):
+                return message
+        raise AssertionError(f"failed to receive register {register_id} response from motor {motor_id}")
+
+    def _write_motor_register_bytes(
+        self,
+        motor_id: int,
+        register_id: int,
+        value_bytes: bytes,
+        max_retry: int = 5,
+    ) -> None:
+        data = bytearray(8)
+        data[0:2] = struct.pack("<H", motor_id)
+        data[2] = 0x55
+        data[3] = register_id
+        data[4:8] = value_bytes
+        message = can.Message(arbitration_id=0x7FF, data=data, is_extended_id=False)
+        for _ in range(max_retry):
+            self._drain_bus(timeout_s=0.002)
+            self.bus.send(message)
+            try:
+                self._receive_register_response(motor_id, register_id, value_bytes)
+                return
+            except AssertionError:
+                continue
+        raise AssertionError(f"failed to write register {register_id} on motor {motor_id}")
+
+    def write_motor_register_float(self, motor_id: int, register_id: int, value: float) -> None:
+        self._write_motor_register_bytes(motor_id, register_id, struct.pack("<f", float(value)))
+
+    def write_motor_register_uint32(self, motor_id: int, register_id: int, value: int) -> None:
+        self._write_motor_register_bytes(motor_id, register_id, struct.pack("<I", int(value)))
+
+    def switch_control_mode(self, motor_id: int, control_mode: str) -> None:
+        self.write_motor_register_uint32(
+            motor_id,
+            MotorRegister.CTRL_MODE,
+            ControlMode.get_ctrl_mode_value(control_mode),
+        )
+
+    def set_profile_limits(self, motor_id: int, max_velocity: float, acceleration: float) -> None:
+        self.write_motor_register_float(motor_id, MotorRegister.ACC, acceleration)
+        self.write_motor_register_float(motor_id, MotorRegister.DEC, -acceleration)
+        self.write_motor_register_float(motor_id, MotorRegister.MAX_SPD, max_velocity)
+
 
 @dataclass
 class MotorCmd:
@@ -363,6 +453,18 @@ class MotorChain(Protocol):
         """Set commands to the motors in the chain."""
         raise NotImplementedError
 
+    def set_control_mode(self, control_mode: str) -> None:
+        """Set the runtime control mode for all motors in the chain."""
+        raise NotImplementedError
+
+    def get_control_mode(self) -> str:
+        """Get the runtime control mode for the chain."""
+        raise NotImplementedError
+
+    def set_profile_limits(self, max_velocity: float, acceleration: float) -> None:
+        """Set onboard position profile limits for all motors in the chain."""
+        raise NotImplementedError
+
 
 class DMChainCanInterface(MotorChain):
     def __init__(
@@ -387,6 +489,8 @@ class DMChainCanInterface(MotorChain):
         assert len(motor_list) == len(motor_offset) == len(motor_direction), (
             f"len{len(motor_list)}, len{len(motor_offset)}, len{len(motor_direction)}"
         )
+        if control_mode != ControlMode.MIT:
+            raise ValueError("DMChainCanInterface must start in MIT; use set_control_mode() after motor bring-up")
         self.motor_list = motor_list
         self.motor_offset = np.array(motor_offset)
         self.motor_direction = np.array(motor_direction)
@@ -406,8 +510,12 @@ class DMChainCanInterface(MotorChain):
                 channel=channel,
                 bitrate=bitrate,
                 name=motor_chain_name,
+                control_mode=control_mode,
                 use_buffered_reader=use_buffered_reader,
             )
+        self.control_mode = control_mode
+        self.profile_max_velocity = 0.5
+        self.profile_acceleration = 1.0
         # CAN bus bandwidth check with 1.1x safety factor
         CAN_FRAME_BITS = 130  # approximate bits per CAN 2.0A frame including overhead
         frames_per_cycle = len(motor_list) * 2  # send + receive per motor
@@ -675,6 +783,31 @@ class DMChainCanInterface(MotorChain):
             motor_feedback.append(fd_back)
         return motor_feedback
 
+    def set_control_mode(self, control_mode: str) -> None:
+        ControlMode.get_id_offset(control_mode)
+        with self.command_lock:
+            for motor_id, _motor_type in self.motor_list:
+                self.motor_interface.switch_control_mode(motor_id, control_mode)
+                time.sleep(0.003)
+            self.motor_interface.control_mode = control_mode
+            self.motor_interface.cmd_idoffset = ControlMode.get_id_offset(control_mode)
+            self.control_mode = control_mode
+
+    def get_control_mode(self) -> str:
+        return self.control_mode
+
+    def set_profile_limits(self, max_velocity: float, acceleration: float) -> None:
+        if max_velocity <= 0.0:
+            raise ValueError("max_velocity must be positive")
+        if acceleration <= 0.0:
+            raise ValueError("acceleration must be positive")
+        with self.command_lock:
+            for motor_id, _motor_type in self.motor_list:
+                self.motor_interface.set_profile_limits(motor_id, max_velocity, acceleration)
+                time.sleep(0.003)
+            self.profile_max_velocity = max_velocity
+            self.profile_acceleration = acceleration
+
     def read_states(self, torques: Optional[np.ndarray] = None) -> List[MotorInfo]:
         motor_infos = []
         timestamp = time.time()
@@ -773,6 +906,22 @@ class MultiDMChainCanInterface(MotorChain):
             motor_infos.extend(infos)
             start_idx = end_idx
         return motor_infos
+
+    def set_control_mode(self, control_mode: str) -> None:
+        for inter in self.interfaces:
+            inter.set_control_mode(control_mode)
+
+    def get_control_mode(self) -> str:
+        modes = [inter.get_control_mode() for inter in self.interfaces]
+        if not modes:
+            raise RuntimeError("no motor interfaces configured")
+        if not all(mode == modes[0] for mode in modes):
+            raise RuntimeError(f"mixed motor control modes: {modes}")
+        return modes[0]
+
+    def set_profile_limits(self, max_velocity: float, acceleration: float) -> None:
+        for inter in self.interfaces:
+            inter.set_profile_limits(max_velocity, acceleration)
 
 
 if __name__ == "__main__":
