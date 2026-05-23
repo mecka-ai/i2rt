@@ -18,6 +18,7 @@ import socket
 import threading
 import time
 import urllib.parse
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -63,13 +64,70 @@ def _browser_visible_url(url: Optional[str]) -> Optional[str]:
     return urllib.parse.urlunparse(parsed._replace(netloc=netloc))
 
 
+@dataclass(frozen=True)
+class _FisheyeCameraModel:
+    camera_matrix: np.ndarray
+    distortion: np.ndarray
+    rectified_camera_matrix: np.ndarray
+    image_size: tuple[int, int]
+
+    @classmethod
+    def create(
+        cls,
+        camera_matrix: Optional[np.ndarray],
+        distortion: Optional[np.ndarray],
+        image_size: tuple[int, int] = _RIGHT_CAMERA_SIZE,
+    ) -> Optional["_FisheyeCameraModel"]:
+        if camera_matrix is None or distortion is None:
+            return None
+        import cv2
+
+        distortion = np.asarray(distortion, dtype=float).reshape(-1)
+        if distortion.size != 4:
+            raise ValueError(f"Expected a 4-coefficient KB4/fisheye distortion model, got {distortion.size}")
+
+        rectified_camera_matrix = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
+            np.asarray(camera_matrix, dtype=float),
+            distortion.reshape(4, 1),
+            image_size,
+            np.eye(3),
+            balance=_FISHEYE_UNDISTORT_BALANCE,
+            new_size=image_size,
+        )
+        rectified_camera_matrix = np.asarray(rectified_camera_matrix, dtype=float)
+        rectified_camera_matrix[0, 2] = image_size[0] / 2.0
+        rectified_camera_matrix[1, 2] = image_size[1] / 2.0
+        return cls(
+            camera_matrix=np.asarray(camera_matrix, dtype=float),
+            distortion=distortion,
+            rectified_camera_matrix=rectified_camera_matrix,
+            image_size=image_size,
+        )
+
+    @property
+    def fov(self) -> float:
+        return float(2.0 * np.arctan(self.image_size[1] / (2.0 * self.rectified_camera_matrix[1, 1])))
+
+    @property
+    def aspect(self) -> float:
+        return float(self.image_size[0] / self.image_size[1])
+
+    def undistort_maps(self, cv2: Any) -> tuple[np.ndarray, np.ndarray]:
+        return cv2.fisheye.initUndistortRectifyMap(
+            self.camera_matrix,
+            self.distortion.reshape(4, 1),
+            np.eye(3),
+            self.rectified_camera_matrix,
+            self.image_size,
+            cv2.CV_16SC2,
+        )
+
+
 class _CameraFeed:
     def __init__(
         self,
         source: str,
-        camera_matrix: Optional[np.ndarray],
-        distortion: Optional[np.ndarray],
-        rectified_camera_matrix: Optional[np.ndarray],
+        camera_model: Optional[_FisheyeCameraModel],
     ) -> None:
         import cv2
 
@@ -77,27 +135,8 @@ class _CameraFeed:
         self._cap = self._open_capture(source)
         self._map1 = None
         self._map2 = None
-        if camera_matrix is not None and distortion is not None and len(distortion.reshape(-1)) == 4:
-            size = _RIGHT_CAMERA_SIZE
-            if rectified_camera_matrix is None:
-                rectified_camera_matrix = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
-                    camera_matrix,
-                    distortion.reshape(4, 1),
-                    size,
-                    np.eye(3),
-                    balance=_FISHEYE_UNDISTORT_BALANCE,
-                    new_size=size,
-                )
-                rectified_camera_matrix[0, 2] = size[0] / 2.0
-                rectified_camera_matrix[1, 2] = size[1] / 2.0
-            self._map1, self._map2 = cv2.fisheye.initUndistortRectifyMap(
-                camera_matrix,
-                distortion.reshape(4, 1),
-                np.eye(3),
-                rectified_camera_matrix,
-                size,
-                cv2.CV_16SC2,
-            )
+        if camera_model is not None:
+            self._map1, self._map2 = camera_model.undistort_maps(cv2)
         self._full_image: Optional[np.ndarray] = None
         self._frustum_image: Optional[np.ndarray] = None
         self._lock = threading.Lock()
@@ -188,9 +227,7 @@ class ViserControlInterface:
         self._camera_feed = (
             _CameraFeed(
                 camera_stream_url,
-                None if self._camera_calibration is None else self._camera_calibration.get("camera_matrix"),
-                None if self._camera_calibration is None else self._camera_calibration.get("distortion"),
-                None if self._camera_calibration is None else self._camera_calibration.get("rectified_camera_matrix"),
+                None if self._camera_calibration is None else self._camera_calibration.get("camera_model"),
             )
             if camera_stream_url is not None
             else None
@@ -392,43 +429,26 @@ class ViserControlInterface:
                 distortion = data["distortion"] if "distortion" in data else None
 
         T_mount_camera, source_key = ViserControlInterface._mount_to_camera_transform(payload)
-        rectified_camera_matrix = None
-        if camera_matrix is not None and distortion is not None and len(distortion.reshape(-1)) == 4:
-            import cv2
-
-            rectified_camera_matrix = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
-                camera_matrix,
-                distortion.reshape(4, 1),
-                _RIGHT_CAMERA_SIZE,
-                np.eye(3),
-                balance=_FISHEYE_UNDISTORT_BALANCE,
-                new_size=_RIGHT_CAMERA_SIZE,
-            )
-            rectified_camera_matrix[0, 2] = _RIGHT_CAMERA_SIZE[0] / 2.0
-            rectified_camera_matrix[1, 2] = _RIGHT_CAMERA_SIZE[1] / 2.0
+        camera_model = _FisheyeCameraModel.create(camera_matrix, distortion)
         offset_m = float(np.linalg.norm(T_mount_camera[:3, 3]))
         print(
             f"[viser] Camera calibration: frame={mount_frame}, source={source_key}, "
             f"offset={T_mount_camera[:3, 3]}"
         )
+        if camera_model is not None:
+            print(
+                "[viser] Camera model: KB4/fisheye, "
+                f"rectified vfov={np.degrees(camera_model.fov):.1f} deg, "
+                f"aspect={camera_model.aspect:.3f}"
+            )
         if offset_m > 0.75:
             print(f"[viser] Warning: camera calibration offset is {offset_m:.3f} m; check mount frame/transform.")
         return {
             "mount_frame": mount_frame,
             "source_key": source_key,
             "T_mount_camera": T_mount_camera,
-            "camera_matrix": camera_matrix,
-            "distortion": distortion,
-            "rectified_camera_matrix": rectified_camera_matrix,
+            "camera_model": camera_model,
         }
-
-    @staticmethod
-    def _camera_fov_aspect(camera_matrix: Optional[np.ndarray]) -> tuple[float, float]:
-        width, height = _RIGHT_CAMERA_SIZE
-        if camera_matrix is None:
-            return float(np.radians(95.0)), width / height
-        fy = float(camera_matrix[1, 1])
-        return float(2.0 * np.arctan(height / (2.0 * fy))), width / height
 
     # ---- Mesh extraction ------------------------------------------------------
 
@@ -542,7 +562,9 @@ class ViserControlInterface:
                 axes_length=0.06,
                 axes_radius=0.002,
             )
-            fov, aspect = self._camera_fov_aspect(self._camera_calibration.get("rectified_camera_matrix"))
+            camera_model = self._camera_calibration.get("camera_model")
+            fov = float(np.radians(95.0)) if camera_model is None else camera_model.fov
+            aspect = _RIGHT_CAMERA_SIZE[0] / _RIGHT_CAMERA_SIZE[1] if camera_model is None else camera_model.aspect
             camera_frustum = server.scene.add_camera_frustum(
                 "calibrated_camera/frustum",
                 fov=fov,
