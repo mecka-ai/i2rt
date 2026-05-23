@@ -15,10 +15,8 @@ See examples/control_with_viser/ for a runnable entry-point and README.
 
 import json
 import socket
-import threading
 import time
 import urllib.parse
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -29,6 +27,11 @@ from i2rt.motor_drivers.dm_driver import PassiveEncoderInfo
 from i2rt.robots.kinematics import Kinematics
 from i2rt.robots.motor_chain_robot import MotorChainRobot
 from i2rt.robots.robot import Robot
+from i2rt.utils.nexus_camera import (
+    CAMERAS,
+    NexusCamera,
+    model_from_npz,
+)
 
 # Teaching-handle button indicator visuals (mirrors mujoco_control_interface.py)
 _BTN_OFF_RGB = (89, 89, 89)
@@ -40,11 +43,7 @@ _BTN_LABELS = ["SYNC", "RECORD"]
 _CAMERA_MOUNT_BODY_ID = 4
 _CAMERA_MOUNT_GEOM_ID = 4
 _CAMERA_MOUNT_OFFSET = np.array([0.0, 0.0, 0.08])
-_CAMERA_FRAME_SIZE = (4000, 1200)
-_RIGHT_CAMERA_SIZE = (1920, 1200)
-_RIGHT_CAMERA_CROP = np.s_[:1200, 2080:4000]
 _DEFAULT_FRUSTUM_SCALE = 0.12
-_FISHEYE_UNDISTORT_BALANCE = 0.5
 _SAFE_TORQUE_LIMIT_NM = 2.0
 
 
@@ -62,133 +61,6 @@ def _browser_visible_url(url: Optional[str]) -> Optional[str]:
     if parsed.port is not None:
         netloc = f"{hostname}:{parsed.port}"
     return urllib.parse.urlunparse(parsed._replace(netloc=netloc))
-
-
-@dataclass(frozen=True)
-class _FisheyeCameraModel:
-    camera_matrix: np.ndarray
-    distortion: np.ndarray
-    rectified_camera_matrix: np.ndarray
-    image_size: tuple[int, int]
-
-    @classmethod
-    def create(
-        cls,
-        camera_matrix: Optional[np.ndarray],
-        distortion: Optional[np.ndarray],
-        image_size: tuple[int, int] = _RIGHT_CAMERA_SIZE,
-    ) -> Optional["_FisheyeCameraModel"]:
-        if camera_matrix is None or distortion is None:
-            return None
-        import cv2
-
-        distortion = np.asarray(distortion, dtype=float).reshape(-1)
-        if distortion.size != 4:
-            raise ValueError(f"Expected a 4-coefficient KB4/fisheye distortion model, got {distortion.size}")
-
-        rectified_camera_matrix = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
-            np.asarray(camera_matrix, dtype=float),
-            distortion.reshape(4, 1),
-            image_size,
-            np.eye(3),
-            balance=_FISHEYE_UNDISTORT_BALANCE,
-            new_size=image_size,
-        )
-        rectified_camera_matrix = np.asarray(rectified_camera_matrix, dtype=float)
-        rectified_camera_matrix[0, 2] = image_size[0] / 2.0
-        rectified_camera_matrix[1, 2] = image_size[1] / 2.0
-        return cls(
-            camera_matrix=np.asarray(camera_matrix, dtype=float),
-            distortion=distortion,
-            rectified_camera_matrix=rectified_camera_matrix,
-            image_size=image_size,
-        )
-
-    @property
-    def fov(self) -> float:
-        return float(2.0 * np.arctan(self.image_size[1] / (2.0 * self.rectified_camera_matrix[1, 1])))
-
-    @property
-    def aspect(self) -> float:
-        return float(self.image_size[0] / self.image_size[1])
-
-    def undistort_maps(self, cv2: Any) -> tuple[np.ndarray, np.ndarray]:
-        return cv2.fisheye.initUndistortRectifyMap(
-            self.camera_matrix,
-            self.distortion.reshape(4, 1),
-            np.eye(3),
-            self.rectified_camera_matrix,
-            self.image_size,
-            cv2.CV_16SC2,
-        )
-
-
-class _CameraFeed:
-    def __init__(
-        self,
-        source: str,
-        camera_model: Optional[_FisheyeCameraModel],
-    ) -> None:
-        import cv2
-
-        self._cv2 = cv2
-        self._cap = self._open_capture(source)
-        self._map1 = None
-        self._map2 = None
-        if camera_model is not None:
-            self._map1, self._map2 = camera_model.undistort_maps(cv2)
-        self._full_image: Optional[np.ndarray] = None
-        self._frustum_image: Optional[np.ndarray] = None
-        self._lock = threading.Lock()
-        self._stop = False
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def _open_capture(self, source: str) -> Any:
-        if source.startswith("/dev/video"):
-            dev_index = int(source.removeprefix("/dev/video"))
-            cap = self._cv2.VideoCapture(dev_index, self._cv2.CAP_V4L2)
-            cap.set(self._cv2.CAP_PROP_FOURCC, self._cv2.VideoWriter_fourcc(*"MJPG"))
-            cap.set(self._cv2.CAP_PROP_FRAME_WIDTH, _CAMERA_FRAME_SIZE[0])
-            cap.set(self._cv2.CAP_PROP_FRAME_HEIGHT, _CAMERA_FRAME_SIZE[1])
-            cap.set(self._cv2.CAP_PROP_FPS, 30)
-            cap.set(self._cv2.CAP_PROP_BUFFERSIZE, 1)
-        else:
-            cap = self._cv2.VideoCapture(source)
-        if not cap.isOpened():
-            raise RuntimeError(f"could not open camera source {source!r}")
-        return cap
-
-    def full_image(self) -> Optional[np.ndarray]:
-        with self._lock:
-            return None if self._full_image is None else self._full_image.copy()
-
-    def frustum_image(self) -> Optional[np.ndarray]:
-        with self._lock:
-            return None if self._frustum_image is None else self._frustum_image.copy()
-
-    def close(self) -> None:
-        self._stop = True
-        self._thread.join(timeout=1.0)
-        self._cap.release()
-
-    def _run(self) -> None:
-        while not self._stop:
-            ok, frame = self._cap.read()
-            if not ok:
-                time.sleep(0.2)
-                continue
-            frustum_frame = frame[_RIGHT_CAMERA_CROP]
-            if self._map1 is not None and self._map2 is not None:
-                frustum_frame = self._cv2.remap(
-                    frustum_frame,
-                    self._map1,
-                    self._map2,
-                    interpolation=self._cv2.INTER_LINEAR,
-                )
-            with self._lock:
-                self._full_image = self._cv2.cvtColor(frame, self._cv2.COLOR_BGR2RGB)
-                self._frustum_image = self._cv2.cvtColor(frustum_frame, self._cv2.COLOR_BGR2RGB)
 
 
 class ViserControlInterface:
@@ -209,6 +81,7 @@ class ViserControlInterface:
         camera_stream_url: Optional[str] = None,
         camera_browser_url: Optional[str] = None,
         camera_calibration: Optional[str] = None,
+        camera_calibrations: Optional[Dict[str, str]] = None,
         camera_mount_frame: str = "geom_4_top",
     ) -> None:
         self._robot = robot
@@ -218,20 +91,23 @@ class ViserControlInterface:
         self._camera_stream_url = camera_stream_url
         self._camera_browser_url = camera_browser_url or _browser_visible_url(camera_stream_url)
         self._camera_mount_frame = camera_mount_frame
-        self._camera_calibration = self._load_camera_calibration(
-            camera_calibration,
-            camera_mount_frame,
-        )
-        if self._camera_calibration is not None:
-            self._camera_mount_frame = self._camera_calibration["mount_frame"]
-        self._camera_feed = (
-            _CameraFeed(
+        calibration_paths = camera_calibrations or {}
+        if camera_calibration is not None and "right" not in calibration_paths:
+            calibration_paths = {**calibration_paths, "right": camera_calibration}
+        self._camera_calibrations = self._load_camera_calibrations(calibration_paths, camera_mount_frame)
+        if camera_stream_url is None:
+            self._camera_feed = None
+        else:
+            self._camera_feed = NexusCamera(
                 camera_stream_url,
-                None if self._camera_calibration is None else self._camera_calibration.get("camera_model"),
+                cameras=CAMERAS.keys(),
+                models={
+                    name: calibration["camera_model"]
+                    for name, calibration in self._camera_calibrations.items()
+                    if calibration.get("camera_model") is not None
+                },
+                start_thread=True,
             )
-            if camera_stream_url is not None
-            else None
-        )
 
         self._model = mujoco.MjModel.from_xml_path(xml_path)
         self._data = mujoco.MjData(self._model)
@@ -274,6 +150,7 @@ class ViserControlInterface:
         camera_stream_url: Optional[str] = None,
         camera_browser_url: Optional[str] = None,
         camera_calibration: Optional[str] = None,
+        camera_calibrations: Optional[Dict[str, str]] = None,
         camera_mount_frame: str = "geom_4_top",
     ) -> "ViserControlInterface":
         return cls(
@@ -285,6 +162,7 @@ class ViserControlInterface:
             camera_stream_url=camera_stream_url,
             camera_browser_url=camera_browser_url,
             camera_calibration=camera_calibration,
+            camera_calibrations=camera_calibrations,
             camera_mount_frame=camera_mount_frame,
         )
 
@@ -402,47 +280,55 @@ class ViserControlInterface:
             return ViserControlInterface._invert_transform(np.asarray(payload["T_camera_mount"], dtype=float)), "T_camera_mount"
         raise ValueError("Calibration must contain T_mount_camera or T_camera_mount")
 
+    @classmethod
+    def _load_camera_calibrations(
+        cls,
+        paths: Dict[str, str],
+        mount_frame: str,
+    ) -> Dict[str, Dict[str, Any]]:
+        calibrations = {}
+        for camera, path in paths.items():
+            calibration = cls._load_camera_calibration(camera, path, mount_frame)
+            if calibration is not None:
+                calibrations[camera] = calibration
+        return calibrations
+
     @staticmethod
     def _load_camera_calibration(
-        path: Optional[str],
+        camera: str,
+        path: str,
         mount_frame: str,
     ) -> Optional[Dict[str, Any]]:
-        if path is None:
-            return None
         p = Path(path).expanduser()
+        if not p.exists():
+            print(f"[viser] Camera calibration missing for {camera}: {p}")
+            return None
 
         payload: Dict[str, Any] = {}
-        camera_matrix = None
-        distortion = None
         if p.suffix == ".npz":
             data = np.load(p)
             payload = {key: data[key] for key in data.files}
-            camera_matrix = data["camera_matrix"] if "camera_matrix" in data else None
-            distortion = data["distortion"] if "distortion" in data else None
+            camera_model = model_from_npz(p, camera)
         else:
             payload = json.loads(p.read_text())
             mount_frame = payload.get("robot_frame", mount_frame)
             sibling_npz = p.with_suffix(".npz")
-            if sibling_npz.exists():
-                data = np.load(sibling_npz)
-                camera_matrix = data["camera_matrix"] if "camera_matrix" in data else None
-                distortion = data["distortion"] if "distortion" in data else None
+            camera_model = model_from_npz(sibling_npz, camera) if sibling_npz.exists() else None
 
         T_mount_camera, source_key = ViserControlInterface._mount_to_camera_transform(payload)
-        camera_model = _FisheyeCameraModel.create(camera_matrix, distortion)
         offset_m = float(np.linalg.norm(T_mount_camera[:3, 3]))
         print(
-            f"[viser] Camera calibration: frame={mount_frame}, source={source_key}, "
+            f"[viser] {camera} camera calibration: frame={mount_frame}, source={source_key}, "
             f"offset={T_mount_camera[:3, 3]}"
         )
         if camera_model is not None:
             print(
-                "[viser] Camera model: KB4/fisheye, "
+                f"[viser] {camera} camera model: KB4/fisheye, "
                 f"rectified vfov={np.degrees(camera_model.fov):.1f} deg, "
                 f"aspect={camera_model.aspect:.3f}"
             )
         if offset_m > 0.75:
-            print(f"[viser] Warning: camera calibration offset is {offset_m:.3f} m; check mount frame/transform.")
+            print(f"[viser] Warning: {camera} camera calibration offset is {offset_m:.3f} m.")
         return {
             "mount_frame": mount_frame,
             "source_key": source_key,
@@ -554,25 +440,26 @@ class ViserControlInterface:
             axes_radius=0.003,
         )
         camera_sidebar_image = None
-        camera_frame = None
-        camera_frustum = None
-        if self._camera_calibration is not None:
-            camera_frame = server.scene.add_frame(
-                "calibrated_camera/opencv_frame",
+        camera_frames: Dict[str, Any] = {}
+        camera_frustums: Dict[str, Any] = {}
+        frustum_colors = {"left": (255, 170, 60), "right": (40, 200, 255)}
+        for camera, calibration in self._camera_calibrations.items():
+            camera_frames[camera] = server.scene.add_frame(
+                f"calibrated_camera/{camera}/opencv_frame",
                 axes_length=0.06,
                 axes_radius=0.002,
             )
-            camera_model = self._camera_calibration.get("camera_model")
+            camera_model = calibration.get("camera_model")
             fov = float(np.radians(95.0)) if camera_model is None else camera_model.fov
-            aspect = _RIGHT_CAMERA_SIZE[0] / _RIGHT_CAMERA_SIZE[1] if camera_model is None else camera_model.aspect
-            camera_frustum = server.scene.add_camera_frustum(
-                "calibrated_camera/frustum",
+            aspect = 1.6 if camera_model is None else camera_model.aspect
+            camera_frustums[camera] = server.scene.add_camera_frustum(
+                f"calibrated_camera/{camera}/frustum",
                 fov=fov,
                 aspect=aspect,
                 scale=_DEFAULT_FRUSTUM_SCALE,
                 line_width=2.0,
-                color=(40, 200, 255),
-                image=None if self._camera_feed is None else self._camera_feed.frustum_image(),
+                color=frustum_colors.get(camera, (40, 200, 255)),
+                image=None if self._camera_feed is None else self._camera_feed.latest_rgb(camera),
                 format="jpeg",
                 jpeg_quality=70,
             )
@@ -642,8 +529,9 @@ class ViserControlInterface:
         if self._camera_feed is not None or self._camera_browser_url is not None or self._camera_mount_frame is not None:
             with server.gui.add_folder("Camera"):
                 server.gui.add_markdown(f"**Mount frame:** `{self._camera_mount_frame}`")
-                if self._camera_calibration is not None:
-                    server.gui.add_markdown(f"**Calibration:** `{self._camera_calibration['source_key']}`")
+                if self._camera_calibrations:
+                    names = ", ".join(sorted(self._camera_calibrations))
+                    server.gui.add_markdown(f"**Calibrated cameras:** `{names}`")
                     frustum_scale_slider = server.gui.add_slider(
                         "Frustum length",
                         min=0.02,
@@ -654,7 +542,7 @@ class ViserControlInterface:
                 else:
                     frustum_scale_slider = None
                 if self._camera_feed is not None:
-                    image = self._camera_feed.full_image()
+                    image = self._camera_feed.latest_full_rgb()
                     if image is None:
                         image = np.zeros((120, 400, 3), dtype=np.uint8)
                     camera_sidebar_image = server.gui.add_image(
@@ -832,21 +720,21 @@ class ViserControlInterface:
                 camera_mount_frame.position = T_mount[:3, 3]
                 camera_mount_frame.wxyz = self._mat3_to_wxyz(T_mount[:3, :3])
 
-                if camera_frame is not None:
-                    T_camera = T_mount @ self._camera_calibration["T_mount_camera"]
-                    camera_frame.position = T_camera[:3, 3]
-                    camera_frame.wxyz = self._mat3_to_wxyz(T_camera[:3, :3])
-                    if camera_frustum is not None:
-                        camera_frustum.position = T_camera[:3, 3]
-                        camera_frustum.wxyz = self._mat3_to_wxyz(T_camera[:3, :3])
-                        if frustum_scale_slider is not None:
-                            camera_frustum.scale = frustum_scale_slider.value
-                        if self._camera_feed is not None:
-                            image = self._camera_feed.frustum_image()
-                            if image is not None:
-                                camera_frustum.image = image
+                for camera, calibration in self._camera_calibrations.items():
+                    T_camera = T_mount @ calibration["T_mount_camera"]
+                    camera_frames[camera].position = T_camera[:3, 3]
+                    camera_frames[camera].wxyz = self._mat3_to_wxyz(T_camera[:3, :3])
+                    frustum = camera_frustums[camera]
+                    frustum.position = T_camera[:3, 3]
+                    frustum.wxyz = self._mat3_to_wxyz(T_camera[:3, :3])
+                    if frustum_scale_slider is not None:
+                        frustum.scale = frustum_scale_slider.value
+                    if self._camera_feed is not None:
+                        image = self._camera_feed.latest_rgb(camera)
+                        if image is not None:
+                            frustum.image = image
                 if camera_sidebar_image is not None and self._camera_feed is not None:
-                    image = self._camera_feed.full_image()
+                    image = self._camera_feed.latest_full_rgb()
                     if image is not None:
                         camera_sidebar_image.image = image
 
