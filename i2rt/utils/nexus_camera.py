@@ -17,7 +17,8 @@ DEVICE_INDEX_SUFFIX = "video-index0"
 REPO_ROOT = Path(__file__).resolve().parents[3]
 REPO_CAMERA_DATA_DIR = REPO_ROOT / "calibration" / "camera_data" / "kb4_6cam" / "per_camera_yaml"
 FRAME_SIZE = (4000, 1200)
-FISHEYE_UNDISTORT_BALANCE = 0.5
+CAMERA_FPS = 30
+DEFAULT_DEWARP_ZOOM = 1.0
 
 
 @dataclass(frozen=True)
@@ -78,7 +79,7 @@ class FisheyeCameraModel:
     distortion: np.ndarray
     rectified_camera_matrix: np.ndarray
     image_size: tuple[int, int]
-    balance: float
+    dewarp_zoom: float
 
     @classmethod
     def from_intrinsics(
@@ -86,28 +87,23 @@ class FisheyeCameraModel:
         camera_matrix: np.ndarray,
         distortion: np.ndarray,
         image_size: tuple[int, int],
-        balance: float = FISHEYE_UNDISTORT_BALANCE,
+        dewarp_zoom: float = DEFAULT_DEWARP_ZOOM,
     ) -> "FisheyeCameraModel":
-        import cv2
-
         distortion = np.asarray(distortion, dtype=float).reshape(-1)
         if distortion.size != 4:
             raise ValueError(f"expected a 4-coefficient KB4/fisheye model, got {distortion.size}")
 
         camera_matrix = np.asarray(camera_matrix, dtype=float)
-        balance = float(np.clip(balance, 0.0, 1.0))
-        rectified = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
-            camera_matrix,
-            distortion.reshape(4, 1),
-            image_size,
-            np.eye(3),
-            balance=balance,
-            new_size=image_size,
+        dewarp_zoom = float(dewarp_zoom)
+        rectified = np.array(
+            [
+                [camera_matrix[0, 0] * dewarp_zoom, 0.0, image_size[0] / 2.0],
+                [0.0, camera_matrix[1, 1] * dewarp_zoom, image_size[1] / 2.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=float,
         )
-        rectified = np.asarray(rectified, dtype=float)
-        rectified[0, 2] = image_size[0] / 2.0
-        rectified[1, 2] = image_size[1] / 2.0
-        return cls(camera_matrix, distortion, rectified, image_size, balance)
+        return cls(camera_matrix, distortion, rectified, image_size, dewarp_zoom)
 
     @property
     def fov(self) -> float:
@@ -117,8 +113,8 @@ class FisheyeCameraModel:
     def aspect(self) -> float:
         return float(self.image_size[0] / self.image_size[1])
 
-    def with_balance(self, balance: float) -> "FisheyeCameraModel":
-        return self.from_intrinsics(self.camera_matrix, self.distortion, self.image_size, balance=balance)
+    def with_dewarp_zoom(self, dewarp_zoom: float) -> "FisheyeCameraModel":
+        return self.from_intrinsics(self.camera_matrix, self.distortion, self.image_size, dewarp_zoom)
 
     def undistort_maps(self, cv2: Any) -> tuple[np.ndarray, np.ndarray]:
         return cv2.fisheye.initUndistortRectifyMap(
@@ -170,7 +166,7 @@ class NexusCamera:
         self._cameras = tuple(camera_spec(name).name for name in cameras)
         self._device = find_nexus_device()
         self._models = {name: models[name] for name in self._cameras}
-        self._balance = float(next(iter(self._models.values())).balance)
+        self._dewarp_zoom = float(next(iter(self._models.values())).dewarp_zoom)
         self._maps = self._make_undistort_maps()
         self._cap = self._open_capture()
         self._latest_full_rgb: np.ndarray | None = None
@@ -189,7 +185,7 @@ class NexusCamera:
         cap.set(self._cv2.CAP_PROP_FOURCC, self._cv2.VideoWriter_fourcc(*"MJPG"))
         cap.set(self._cv2.CAP_PROP_FRAME_WIDTH, FRAME_SIZE[0])
         cap.set(self._cv2.CAP_PROP_FRAME_HEIGHT, FRAME_SIZE[1])
-        cap.set(self._cv2.CAP_PROP_FPS, 30)
+        cap.set(self._cv2.CAP_PROP_FPS, CAMERA_FPS)
         cap.set(self._cv2.CAP_PROP_BUFFERSIZE, 1)
         if not cap.isOpened():
             raise RuntimeError(f"could not open {self._device}")
@@ -234,18 +230,18 @@ class NexusCamera:
         with self._lock:
             return self._latest_rgb[camera].copy()
 
-    def dewarp_balance(self) -> float:
-        with self._lock:
-            return self._balance
-
     def camera_model(self, camera: str) -> FisheyeCameraModel:
         with self._lock:
             return self._models[camera]
 
+    def dewarp_zoom(self) -> float:
+        with self._lock:
+            return self._dewarp_zoom
+
     def camera_info(self) -> dict[str, object]:
         with self._lock:
             return {
-                "dewarp_balance": self._balance,
+                "dewarp_zoom": self._dewarp_zoom,
                 "models": {
                     name: {
                         "fov": self._models[name].fov,
@@ -257,21 +253,23 @@ class NexusCamera:
                 },
             }
 
-    def set_dewarp_balance(self, balance: float) -> dict[str, object]:
-        balance = float(np.clip(balance, 0.0, 1.0))
+    def set_dewarp_zoom(self, dewarp_zoom: float) -> dict[str, object]:
         with self._lock:
             self._models = {
-                name: model.with_balance(balance)
+                name: model.with_dewarp_zoom(dewarp_zoom)
                 for name, model in self._models.items()
             }
-            self._balance = balance
+            self._dewarp_zoom = float(dewarp_zoom)
             self._maps = self._make_undistort_maps()
             return self.camera_info()
 
     def _run(self) -> None:
+        period = 1.0 / CAMERA_FPS
         while not self._stop:
+            start = time.time()
             _, frame = self.read_full()
             self._publish_frame(frame)
+            time.sleep(max(0.0, period - (time.time() - start)))
 
     def _publish_frame(self, frame: np.ndarray) -> None:
         with self._lock:

@@ -77,16 +77,8 @@ toggle switches the left/right frustums to `left_detections_overlay` and
 `right_detections_overlay`; RF-DETR medium inference starts only while those
 overlay streams or raw detection streams are subscribed.
 
-The Camera panel's `Dewarp balance` slider updates the same server-side
-rectification maps used by the frustum streams. The JSON-RPC method is:
-
-```python
-from robot_control import RobotClient
-
-client = RobotClient("ws://atlascm7660:8765")
-camera_info = client.set_camera_dewarp_balance(0.75)
-print(camera_info["dewarp_balance"])
-```
+The Camera panel's `Dewarp zoom` slider updates the shared centered rectified
+projection used by both left/right frustum streams.
 
 Raw detection JSON is available over the same WebSocket server:
 
