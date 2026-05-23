@@ -94,8 +94,8 @@ for payload in client.stream_detections("left"):
 Hand-eye calibration outputs are discovered from:
 
 ```text
-/home/radxa/artifacts/hand_eye/hand_eye.json
-/home/radxa/artifacts/hand_eye_left/hand_eye.json
+/home/radxa/elevator_detection/calibration/camera_data/hand_eye/right/hand_eye.json
+/home/radxa/elevator_detection/calibration/camera_data/hand_eye/left/hand_eye.json
 ```
 
 Run both-camera calibration:

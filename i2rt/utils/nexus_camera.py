@@ -16,6 +16,7 @@ DEVICE_ID_SUBSTRING = "Atlas_Nexus2"
 DEVICE_INDEX_SUFFIX = "video-index0"
 REPO_ROOT = Path(__file__).resolve().parents[3]
 REPO_CAMERA_DATA_DIR = REPO_ROOT / "calibration" / "camera_data" / "kb4_6cam" / "per_camera_yaml"
+REPO_HAND_EYE_DIR = REPO_ROOT / "calibration" / "camera_data" / "hand_eye"
 FRAME_SIZE = (4000, 1200)
 CAMERA_FPS = 30
 DEFAULT_DEWARP_ZOOM = 1.0
@@ -65,8 +66,7 @@ def camera_spec(name: str) -> CameraSpec:
 
 def hand_eye_output_dir(camera: str) -> Path:
     camera_spec(camera)
-    suffix = "" if camera == "right" else f"_{camera}"
-    return Path(f"/home/radxa/artifacts/hand_eye{suffix}")
+    return REPO_HAND_EYE_DIR / camera
 
 
 def hand_eye_calibration_path(camera: str) -> Path:
@@ -202,6 +202,10 @@ class NexusCamera:
         if self._thread is not None:
             self._thread.join(timeout=1.0)
         self._cap.release()
+
+    @property
+    def device(self) -> str:
+        return self._device
 
     def read_full(self, flush_frames: int = 1) -> tuple[float, np.ndarray]:
         frame = None
