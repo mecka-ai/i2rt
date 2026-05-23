@@ -78,6 +78,7 @@ class FisheyeCameraModel:
     distortion: np.ndarray
     rectified_camera_matrix: np.ndarray
     image_size: tuple[int, int]
+    balance: float
 
     @classmethod
     def from_intrinsics(
@@ -85,6 +86,7 @@ class FisheyeCameraModel:
         camera_matrix: np.ndarray,
         distortion: np.ndarray,
         image_size: tuple[int, int],
+        balance: float = FISHEYE_UNDISTORT_BALANCE,
     ) -> "FisheyeCameraModel":
         import cv2
 
@@ -93,18 +95,19 @@ class FisheyeCameraModel:
             raise ValueError(f"expected a 4-coefficient KB4/fisheye model, got {distortion.size}")
 
         camera_matrix = np.asarray(camera_matrix, dtype=float)
+        balance = float(np.clip(balance, 0.0, 1.0))
         rectified = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
             camera_matrix,
             distortion.reshape(4, 1),
             image_size,
             np.eye(3),
-            balance=FISHEYE_UNDISTORT_BALANCE,
+            balance=balance,
             new_size=image_size,
         )
         rectified = np.asarray(rectified, dtype=float)
         rectified[0, 2] = image_size[0] / 2.0
         rectified[1, 2] = image_size[1] / 2.0
-        return cls(camera_matrix, distortion, rectified, image_size)
+        return cls(camera_matrix, distortion, rectified, image_size, balance)
 
     @property
     def fov(self) -> float:
@@ -113,6 +116,9 @@ class FisheyeCameraModel:
     @property
     def aspect(self) -> float:
         return float(self.image_size[0] / self.image_size[1])
+
+    def with_balance(self, balance: float) -> "FisheyeCameraModel":
+        return self.from_intrinsics(self.camera_matrix, self.distortion, self.image_size, balance=balance)
 
     def undistort_maps(self, cv2: Any) -> tuple[np.ndarray, np.ndarray]:
         return cv2.fisheye.initUndistortRectifyMap(
@@ -163,14 +169,13 @@ class NexusCamera:
         self._cv2 = cv2
         self._cameras = tuple(camera_spec(name).name for name in cameras)
         self._device = find_nexus_device()
-        self._maps = {
-            name: models[name].undistort_maps(cv2)
-            for name in self._cameras
-        }
+        self._models = {name: models[name] for name in self._cameras}
+        self._balance = float(next(iter(self._models.values())).balance)
+        self._maps = self._make_undistort_maps()
         self._cap = self._open_capture()
         self._latest_full_rgb: np.ndarray | None = None
         self._latest_rgb: dict[str, np.ndarray] = {}
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._stop = False
         self._thread: threading.Thread | None = None
         if start_thread:
@@ -189,6 +194,12 @@ class NexusCamera:
         if not cap.isOpened():
             raise RuntimeError(f"could not open {self._device}")
         return cap
+
+    def _make_undistort_maps(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+        return {
+            name: self._models[name].undistort_maps(self._cv2)
+            for name in self._cameras
+        }
 
     def close(self) -> None:
         self._stop = True
@@ -223,16 +234,52 @@ class NexusCamera:
         with self._lock:
             return self._latest_rgb[camera].copy()
 
+    def dewarp_balance(self) -> float:
+        with self._lock:
+            return self._balance
+
+    def camera_model(self, camera: str) -> FisheyeCameraModel:
+        with self._lock:
+            return self._models[camera]
+
+    def camera_info(self) -> dict[str, object]:
+        with self._lock:
+            return {
+                "dewarp_balance": self._balance,
+                "models": {
+                    name: {
+                        "fov": self._models[name].fov,
+                        "aspect": self._models[name].aspect,
+                        "image_size": self._models[name].image_size,
+                        "rectified_camera_matrix": self._models[name].rectified_camera_matrix,
+                    }
+                    for name in self._cameras
+                },
+            }
+
+    def set_dewarp_balance(self, balance: float) -> dict[str, object]:
+        balance = float(np.clip(balance, 0.0, 1.0))
+        with self._lock:
+            self._models = {
+                name: model.with_balance(balance)
+                for name, model in self._models.items()
+            }
+            self._balance = balance
+            self._maps = self._make_undistort_maps()
+            return self.camera_info()
+
     def _run(self) -> None:
         while not self._stop:
             _, frame = self.read_full()
             self._publish_frame(frame)
 
     def _publish_frame(self, frame: np.ndarray) -> None:
+        with self._lock:
+            maps = dict(self._maps)
         camera_images = {}
         for name in self._cameras:
             image = camera_spec(name).crop(frame)
-            map1, map2 = self._maps[name]
+            map1, map2 = maps[name]
             image = self._cv2.remap(image, map1, map2, interpolation=self._cv2.INTER_LINEAR)
             camera_images[name] = self._cv2.cvtColor(image, self._cv2.COLOR_BGR2RGB)
         with self._lock:

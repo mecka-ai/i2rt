@@ -503,6 +503,13 @@ class ViserControlInterface:
                 step=0.01,
                 initial_value=_DEFAULT_FRUSTUM_SCALE,
             )
+            dewarp_balance_slider = server.gui.add_slider(
+                "Dewarp balance",
+                min=0.0,
+                max=1.0,
+                step=0.05,
+                initial_value=float(self._camera_feed.dewarp_balance()),
+            )
             detection_overlay_cb = server.gui.add_checkbox("Detection boxes", initial_value=False)
             camera_sidebar_image = server.gui.add_image(
                 self._camera_feed.latest_full_rgb(),
@@ -600,6 +607,19 @@ class ViserControlInterface:
             if not has_profile_control:
                 return
             self._robot.set_profile_limits(float(profile_velocity_slider.value), float(profile_accel_slider.value))
+
+        def _apply_camera_info(camera_info: Dict[str, Any]) -> None:
+            models = camera_info.get("models")
+            if models is None:
+                models = {
+                    camera: calibration["model"]
+                    for camera, calibration in camera_info["calibrations"].items()
+                }
+            for camera, model in models.items():
+                camera_model = FrustumCameraModel(fov=float(model["fov"]), aspect=float(model["aspect"]))
+                self._camera_calibrations[camera]["camera_model"] = camera_model
+                camera_frustums[camera].fov = camera_model.fov
+                camera_frustums[camera].aspect = camera_model.aspect
 
         _set_profile_widgets_enabled()
 
@@ -716,6 +736,10 @@ class ViserControlInterface:
         @detection_overlay_cb.on_update
         def _(_: object) -> None:
             self._camera_feed.set_detection_overlay(bool(detection_overlay_cb.value))
+
+        @dewarp_balance_slider.on_update
+        def _(_: object) -> None:
+            _apply_camera_info(self._camera_feed.set_dewarp_balance(float(dewarp_balance_slider.value)))
 
         # ---- Main loop -------------------------------------------------------
         prev_controlled = False
