@@ -54,6 +54,35 @@ def test_pos_vel_control_packet_uses_profile_frame() -> None:
     assert sent["max_retry"] == 15
 
 
+def test_vel_control_packet_uses_velocity_frame() -> None:
+    iface = DMSingleMotorCanInterface.__new__(DMSingleMotorCanInterface)
+    iface.control_mode = ControlMode.VEL
+    iface.cmd_idoffset = ControlMode.get_id_offset(ControlMode.VEL)
+    sent: dict[str, Any] = {}
+
+    def send(
+        frame_id: int,
+        motor_id: int,
+        data: bytearray,
+        max_retry: int = 15,
+    ) -> can.Message:
+        sent["frame_id"] = frame_id
+        sent["motor_id"] = motor_id
+        sent["data"] = bytes(data)
+        sent["max_retry"] = max_retry
+        return can.Message(arbitration_id=motor_id + 16, data=bytearray(8), is_extended_id=False)
+
+    iface._send_message_get_response = send
+    iface.parse_recv_message = lambda message, motor_type: _feedback()
+
+    iface.set_control(0x04, MotorType.DM4340, pos=1.25, vel=-0.5, kp=80.0, kd=5.0, torque=3.0)
+
+    assert sent["frame_id"] == 0x204
+    assert sent["motor_id"] == 0x04
+    assert sent["data"] == struct.pack("<f", -0.5) + bytes(4)
+    assert sent["max_retry"] == 15
+
+
 def test_motor_register_writes_match_damiao_format() -> None:
     iface = DMSingleMotorCanInterface.__new__(DMSingleMotorCanInterface)
     messages: list[can.Message] = []
@@ -82,7 +111,7 @@ def test_motor_register_writes_match_damiao_format() -> None:
     iface.use_buffered_reader = False
 
     iface.switch_control_mode(0x04, ControlMode.POS_VEL)
-    iface.set_profile_limits(0x04, max_velocity=0.5, acceleration=1.0)
+    iface.set_motion_profile(0x04, max_speed=0.5, acceleration=1.0, deceleration=1.0)
 
     assert [msg.arbitration_id for msg in messages] == [0x7FF, 0x7FF, 0x7FF, 0x7FF]
     assert ack_reads == 4
@@ -90,6 +119,36 @@ def test_motor_register_writes_match_damiao_format() -> None:
     assert bytes(messages[1].data) == struct.pack("<HBBf", 0x04, 0x55, MotorRegister.ACC, 1.0)
     assert bytes(messages[2].data) == struct.pack("<HBBf", 0x04, 0x55, MotorRegister.DEC, -1.0)
     assert bytes(messages[3].data) == struct.pack("<HBBf", 0x04, 0x55, MotorRegister.MAX_SPD, 0.5)
+
+
+def test_vel_control_mode_switch_writes_damiao_mode_value() -> None:
+    iface = DMSingleMotorCanInterface.__new__(DMSingleMotorCanInterface)
+    messages: list[can.Message] = []
+
+    class Bus:
+        pending_ack = False
+
+        def send(self, message: can.Message) -> None:
+            self.pending_ack = True
+            messages.append(message)
+
+        def recv(self, timeout: float = 0.001) -> can.Message | None:
+            if not self.pending_ack:
+                return None
+            self.pending_ack = False
+            return can.Message(
+                arbitration_id=0x7FF,
+                data=bytearray(messages[-1].data),
+                is_extended_id=False,
+            )
+
+    iface.bus = Bus()
+    iface.use_buffered_reader = False
+
+    iface.switch_control_mode(0x04, ControlMode.VEL)
+
+    assert [msg.arbitration_id for msg in messages] == [0x7FF]
+    assert bytes(messages[0].data) == struct.pack("<HBBI", 0x04, 0x55, MotorRegister.CTRL_MODE, 3)
 
 
 def test_motor_register_write_rejects_stale_ack() -> None:
@@ -160,7 +219,9 @@ def test_motor_chain_syncs_hardware_mit_mode_on_startup(monkeypatch: pytest.Monk
 class FakeMotorChain:
     def __init__(self) -> None:
         self.mode = ControlMode.MIT
-        self.profile_limits: tuple[float, float] | None = None
+        self.motor_max_speed: float | None = None
+        self.profile_acceleration: tuple[float, float] | None = None
+        self.motion_profile: tuple[float, float, float] | None = None
         self.last_command: dict[str, np.ndarray | None] | None = None
         self.running = True
 
@@ -197,8 +258,14 @@ class FakeMotorChain:
     def get_control_mode(self) -> str:
         return self.mode
 
-    def set_profile_limits(self, max_velocity: float, acceleration: float) -> None:
-        self.profile_limits = (max_velocity, acceleration)
+    def set_motor_max_speed(self, max_speed: float) -> None:
+        self.motor_max_speed = max_speed
+
+    def set_profile_acceleration(self, acceleration: float, deceleration: float) -> None:
+        self.profile_acceleration = (acceleration, deceleration)
+
+    def set_motion_profile(self, max_speed: float, acceleration: float, deceleration: float) -> None:
+        self.motion_profile = (max_speed, acceleration, deceleration)
 
     def close(self) -> None:
         self.running = False
@@ -214,8 +281,9 @@ def test_robot_pos_vel_mode_uses_profile_velocity_in_position_commands() -> None
         kd=[0.1, 0.1],
         joint_limits=np.array([[-1.0, 1.0], [-1.0, 1.0]]),
         zero_gravity_mode=False,
-        profile_max_velocity=0.4,
+        motor_max_speed=0.4,
         profile_acceleration=0.8,
+        profile_deceleration=0.7,
     )
 
     try:
@@ -223,7 +291,7 @@ def test_robot_pos_vel_mode_uses_profile_velocity_in_position_commands() -> None
         robot.command_joint_pos(np.array([0.3, -0.4]))
 
         assert chain.mode == ControlMode.POS_VEL
-        assert chain.profile_limits == (0.4, 0.8)
+        assert chain.motion_profile == (0.4, 0.8, 0.7)
         with robot._command_lock:
             np.testing.assert_allclose(robot._commands.pos, [0.3, -0.4])
             np.testing.assert_allclose(robot._commands.vel, [0.4, 0.4])
@@ -231,7 +299,36 @@ def test_robot_pos_vel_mode_uses_profile_velocity_in_position_commands() -> None
         robot.close()
 
 
-def test_robot_rejects_non_positive_profile_limits() -> None:
+def test_robot_vel_mode_accepts_velocity_only_joint_state() -> None:
+    chain = FakeMotorChain()
+    robot = MotorChainRobot(
+        motor_chain=chain,
+        xml_path=None,
+        use_gravity_comp=False,
+        kp=[1.0, 1.0],
+        kd=[0.1, 0.1],
+        joint_limits=np.array([[-1.0, 1.0], [-1.0, 1.0]]),
+        zero_gravity_mode=False,
+        motor_max_speed=0.4,
+        profile_acceleration=0.8,
+    )
+
+    try:
+        robot.set_motor_control_mode(ControlMode.VEL)
+        robot.command_joint_state({"vel": np.array([0.6, -0.7])})
+
+        assert chain.mode == ControlMode.VEL
+        assert chain.motion_profile is None
+        with robot._command_lock:
+            np.testing.assert_allclose(robot._commands.pos, [0.0, 0.0])
+            np.testing.assert_allclose(robot._commands.vel, [0.6, -0.7])
+            np.testing.assert_allclose(robot._commands.kp, [0.0, 0.0])
+            np.testing.assert_allclose(robot._commands.kd, [0.0, 0.0])
+    finally:
+        robot.close()
+
+
+def test_robot_rejects_non_positive_motor_max_speed() -> None:
     chain = FakeMotorChain()
     with pytest.raises(ValueError):
         MotorChainRobot(
@@ -239,5 +336,53 @@ def test_robot_rejects_non_positive_profile_limits() -> None:
             xml_path=None,
             use_gravity_comp=False,
             joint_limits=np.array([[-1.0, 1.0], [-1.0, 1.0]]),
-            profile_max_velocity=0.0,
+            motor_max_speed=0.0,
         )
+
+
+def test_robot_updates_motor_max_speed_without_changing_pos_vel_command_speed() -> None:
+    chain = FakeMotorChain()
+    robot = MotorChainRobot(
+        motor_chain=chain,
+        xml_path=None,
+        use_gravity_comp=False,
+        kp=[1.0, 1.0],
+        kd=[0.1, 0.1],
+        joint_limits=np.array([[-1.0, 1.0], [-1.0, 1.0]]),
+        zero_gravity_mode=False,
+        motor_max_speed=0.4,
+        position_command_max_velocity=0.2,
+    )
+
+    try:
+        robot.set_motor_max_speed(0.8)
+        robot.set_motor_control_mode(ControlMode.POS_VEL)
+        robot.command_joint_pos(np.array([0.3, -0.4]))
+
+        assert chain.motor_max_speed == 0.8
+        with robot._command_lock:
+            np.testing.assert_allclose(robot._commands.vel, [0.2, 0.2])
+    finally:
+        robot.close()
+
+
+def test_robot_motion_profile_does_not_change_pos_vel_command_speed() -> None:
+    chain = FakeMotorChain()
+    robot = MotorChainRobot(
+        motor_chain=chain,
+        xml_path=None,
+        use_gravity_comp=False,
+        kp=[1.0, 1.0],
+        kd=[0.1, 0.1],
+        joint_limits=np.array([[-1.0, 1.0], [-1.0, 1.0]]),
+        zero_gravity_mode=False,
+        motor_max_speed=0.4,
+        position_command_max_velocity=0.2,
+    )
+
+    try:
+        robot.set_motion_profile(0.8, 1.2, 1.4)
+        assert chain.motion_profile == (0.8, 1.2, 1.4)
+        assert robot.get_robot_info()["position_command_max_velocity"] == 0.2
+    finally:
+        robot.close()

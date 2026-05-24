@@ -94,8 +94,10 @@ class MotorChainRobot(Robot):
         pinned_cpu: int | None = None,
         joint_state_saver_factory: Optional[Callable[[], Any]] = None,
         set_realtime_and_pin_callback: Optional[Callable[[int], None]] = None,
-        profile_max_velocity: float = 0.5,
+        motor_max_speed: float = 0.5,
         profile_acceleration: float = 1.0,
+        profile_deceleration: float | None = None,
+        position_command_max_velocity: float | None = None,
     ) -> None:
         # Set up CPU pinning and real-time scheduling if requested
         if pinned_cpu is not None and set_realtime_and_pin_callback is not None:
@@ -139,13 +141,19 @@ class MotorChainRobot(Robot):
 
         self._last_gripper_command_qpos = 1  # initialize as fully open
         assert clip_motor_torque >= 0.0
-        if profile_max_velocity <= 0.0:
-            raise ValueError("profile_max_velocity must be positive")
-        if profile_acceleration <= 0.0:
-            raise ValueError("profile_acceleration must be positive")
+        if profile_deceleration is None:
+            profile_deceleration = profile_acceleration
+        if position_command_max_velocity is None:
+            position_command_max_velocity = motor_max_speed
+        self._require_positive("motor_max_speed", motor_max_speed)
+        self._require_positive("profile_acceleration", profile_acceleration)
+        self._require_positive("profile_deceleration", profile_deceleration)
+        self._require_positive("position_command_max_velocity", position_command_max_velocity)
         self._clip_motor_torque = clip_motor_torque
-        self._profile_max_velocity = float(profile_max_velocity)
+        self._motor_max_speed = float(motor_max_speed)
         self._profile_acceleration = float(profile_acceleration)
+        self._profile_deceleration = float(profile_deceleration)
+        self._position_command_max_velocity = float(position_command_max_velocity)
         self.motor_chain = motor_chain
         self.use_gravity_comp = use_gravity_comp
         self.gravity_comp_factor = (
@@ -314,8 +322,10 @@ class MotorChainRobot(Robot):
             "gripper_index": self._gripper_index,
             "clip_motor_torque": self._clip_motor_torque,
             "control_mode": self.get_motor_control_mode(),
-            "profile_max_velocity": self._profile_max_velocity,
+            "motor_max_speed": self._motor_max_speed,
             "profile_acceleration": self._profile_acceleration,
+            "profile_deceleration": self._profile_deceleration,
+            "position_command_max_velocity": self._position_command_max_velocity,
         }
         if self._gripper_index is not None:
             info["limit_gripper_effort"] = self._limit_gripper_force
@@ -556,7 +566,7 @@ class MotorChainRobot(Robot):
             self._commands = JointCommands.init_all_zero(len(self.motor_chain))
             self._commands.pos = self.remapper.to_robot_joint_pos_space(pos)
             if self.get_motor_control_mode() == ControlMode.POS_VEL:
-                max_vel = np.full(len(self.motor_chain), self._profile_max_velocity)
+                max_vel = np.full(len(self.motor_chain), self._position_command_max_velocity)
                 self._commands.vel = self.remapper.to_robot_joint_vel_space(max_vel)
             self._commands.kp = self._kp
             self._commands.kd = self._kd
@@ -567,12 +577,18 @@ class MotorChainRobot(Robot):
         Args:
             joint_state (Dict[str, np.ndarray]): The state to command the leader robot to.
         """
-        pos = self._clip_robot_joint_pos_command(joint_state["pos"])
         vel = joint_state["vel"]
-        self._commands = JointCommands.init_all_zero(len(self.motor_chain))
+        if self.get_motor_control_mode() == ControlMode.VEL:
+            with self._command_lock:
+                self._commands = JointCommands.init_all_zero(len(self.motor_chain))
+                self._commands.vel = self.remapper.to_robot_joint_vel_space(vel)
+            return
+
+        pos = self._clip_robot_joint_pos_command(joint_state["pos"])
         kp = joint_state.get("kp", self._kp)
         kd = joint_state.get("kd", self._kd)
         with self._command_lock:
+            self._commands = JointCommands.init_all_zero(len(self.motor_chain))
             self._commands.pos = self.remapper.to_robot_joint_pos_space(pos)
             self._commands.vel = self.remapper.to_robot_joint_vel_space(vel)
             self._commands.kp = kp
@@ -671,17 +687,50 @@ class MotorChainRobot(Robot):
         self.command_joint_pos(current_pos)
         self.motor_chain.set_control_mode(control_mode)
         if control_mode == ControlMode.POS_VEL:
-            self.set_profile_limits(self._profile_max_velocity, self._profile_acceleration)
+            self.motor_chain.set_motion_profile(
+                self._motor_max_speed,
+                self._profile_acceleration,
+                self._profile_deceleration,
+            )
         self.command_joint_pos(current_pos)
 
-    def set_profile_limits(self, max_velocity: float, acceleration: float) -> None:
-        if max_velocity <= 0.0:
-            raise ValueError("max_velocity must be positive")
-        if acceleration <= 0.0:
-            raise ValueError("acceleration must be positive")
-        self._profile_max_velocity = float(max_velocity)
+    @staticmethod
+    def _require_positive(name: str, value: float) -> None:
+        if value <= 0.0:
+            raise ValueError(f"{name} must be positive")
+
+    def set_motor_max_speed(self, max_speed: float) -> None:
+        self._require_positive("max_speed", max_speed)
+        self._motor_max_speed = float(max_speed)
+        self.motor_chain.set_motor_max_speed(self._motor_max_speed)
+
+    def set_profile_acceleration(self, acceleration: float, deceleration: float | None = None) -> None:
+        if deceleration is None:
+            deceleration = acceleration
+        self._require_positive("acceleration", acceleration)
+        self._require_positive("deceleration", deceleration)
         self._profile_acceleration = float(acceleration)
-        self.motor_chain.set_profile_limits(self._profile_max_velocity, self._profile_acceleration)
+        self._profile_deceleration = float(deceleration)
+        self.motor_chain.set_profile_acceleration(self._profile_acceleration, self._profile_deceleration)
+
+    def set_position_command_max_velocity(self, max_velocity: float) -> None:
+        self._require_positive("max_velocity", max_velocity)
+        self._position_command_max_velocity = float(max_velocity)
+
+    def set_motion_profile(self, max_speed: float, acceleration: float, deceleration: float | None = None) -> None:
+        if deceleration is None:
+            deceleration = acceleration
+        self._require_positive("max_speed", max_speed)
+        self._require_positive("acceleration", acceleration)
+        self._require_positive("deceleration", deceleration)
+        self._motor_max_speed = float(max_speed)
+        self._profile_acceleration = float(acceleration)
+        self._profile_deceleration = float(deceleration)
+        self.motor_chain.set_motion_profile(
+            self._motor_max_speed,
+            self._profile_acceleration,
+            self._profile_deceleration,
+        )
 
     def enter_gravity_comp_idle(self) -> None:
         """Reset active commands to gravity-comp idle.

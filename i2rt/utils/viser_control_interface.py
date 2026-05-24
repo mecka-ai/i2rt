@@ -37,8 +37,8 @@ _CAMERA_MOUNT_OFFSET_LOCAL = np.array([-0.11963644, 0.04517079, -0.03549660])
 _DEFAULT_FRUSTUM_SCALE = 0.12
 _DEFAULT_TORQUE_LIMIT_NM = 2.0
 _MAX_TORQUE_LIMIT_NM = 4.0
-_DEFAULT_PROFILE_MAX_VELOCITY = 0.5
-_MAX_PROFILE_MAX_VELOCITY = 4.0
+_DEFAULT_MOTOR_MAX_SPEED = 0.5
+_MAX_MOTOR_MAX_SPEED = 12.0
 _DEFAULT_PROFILE_ACCELERATION = 1.0
 
 
@@ -433,7 +433,7 @@ class ViserControlInterface:
         has_kpkd = "kp" in info and hasattr(self._robot, "update_kp_kd")
         has_profile_control = (
             hasattr(self._robot, "set_motor_control_mode")
-            and hasattr(self._robot, "set_profile_limits")
+            and hasattr(self._robot, "set_motion_profile")
             and not self._is_sim
         )
 
@@ -471,25 +471,36 @@ class ViserControlInterface:
                 step=0.05,
                 initial_value=self._gain_scale,
             )
-            profile_velocity_slider = server.gui.add_slider(
-                "Max velocity (rad/s)",
+            motor_max_speed = float(info.get("motor_max_speed", _DEFAULT_MOTOR_MAX_SPEED))
+            motor_max_speed_slider = server.gui.add_slider(
+                "Motor max speed (rad/s)",
                 min=0.05,
-                max=_MAX_PROFILE_MAX_VELOCITY,
+                max=max(_MAX_MOTOR_MAX_SPEED, motor_max_speed),
                 step=0.05,
-                initial_value=float(info.get("profile_max_velocity", _DEFAULT_PROFILE_MAX_VELOCITY)),
+                initial_value=motor_max_speed,
             )
             profile_accel_slider = server.gui.add_slider(
-                "Accel/decel (rad/s^2)",
+                "Acceleration (rad/s^2)",
                 min=0.1,
                 max=5.0,
                 step=0.1,
                 initial_value=float(info.get("profile_acceleration", _DEFAULT_PROFILE_ACCELERATION)),
             )
+            profile_decel_slider = server.gui.add_slider(
+                "Deceleration (rad/s^2)",
+                min=0.1,
+                max=5.0,
+                step=0.1,
+                initial_value=float(
+                    info.get("profile_deceleration", info.get("profile_acceleration", _DEFAULT_PROFILE_ACCELERATION))
+                ),
+            )
             motor_mode_dd.disabled = True
             torque_limit_slider.disabled = True
             gain_scale_slider.disabled = True
-            profile_velocity_slider.disabled = True
+            motor_max_speed_slider.disabled = True
             profile_accel_slider.disabled = True
+            profile_decel_slider.disabled = True
 
         # ---- GUI — camera feed -----------------------------------------------
         with server.gui.add_folder("Camera"):
@@ -589,13 +600,15 @@ class ViserControlInterface:
             motor_mode_dd.visible = supported
             torque_limit_slider.visible = supported and mit_selected
             gain_scale_slider.visible = supported and mit_selected
-            profile_velocity_slider.visible = supported and profile_selected
+            motor_max_speed_slider.visible = supported and profile_selected
             profile_accel_slider.visible = supported and profile_selected
+            profile_decel_slider.visible = supported and profile_selected
             motor_mode_dd.disabled = not enabled
             torque_limit_slider.disabled = not mit_enabled
             gain_scale_slider.disabled = not mit_enabled
-            profile_velocity_slider.disabled = not profile_enabled
+            motor_max_speed_slider.disabled = not profile_enabled
             profile_accel_slider.disabled = not profile_enabled
+            profile_decel_slider.disabled = not profile_enabled
             for slider in kp_sliders + kd_sliders:
                 slider.visible = supported and mit_selected
                 slider.disabled = not mit_enabled
@@ -606,7 +619,11 @@ class ViserControlInterface:
         def _apply_motor_profile_settings() -> None:
             if not has_profile_control:
                 return
-            self._robot.set_profile_limits(float(profile_velocity_slider.value), float(profile_accel_slider.value))
+            self._robot.set_motion_profile(
+                float(motor_max_speed_slider.value),
+                float(profile_accel_slider.value),
+                float(profile_decel_slider.value),
+            )
 
         def _apply_camera_info(camera_info: Dict[str, Any]) -> None:
             for camera, calibration in camera_info["calibrations"].items():
@@ -695,7 +712,7 @@ class ViserControlInterface:
             print(f"[viser] Motor command mode set to {selected}")
             _set_profile_widgets_enabled()
 
-        @profile_velocity_slider.on_update
+        @motor_max_speed_slider.on_update
         def _(_: object) -> None:
             _apply_motor_profile_settings()
 

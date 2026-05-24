@@ -217,9 +217,8 @@ class DMSingleMotorCanInterface(CanInterface):
         Args:
             motor_id (int): The ID of the motor to turn off.
         """
-        id = self._get_frame_id(motor_id)
         data = [0xFF] * 7 + [0xFD]
-        self._send_message_get_response(id, motor_id, data)
+        self._send_message_get_response(motor_id, motor_id, data)
 
     def emergency_motor_off(self, motor_id: int) -> None:
         """Send a motor-off frame without waiting for a response."""
@@ -232,14 +231,13 @@ class DMSingleMotorCanInterface(CanInterface):
         Args:
             motor_id (int): The ID of the motor to save zero position.
         """
-        id = self._get_frame_id(motor_id)
         data = [0xFF] * 7 + [0xFE]
         try:
-            message = self._send_message_get_response(id, motor_id, data, 2)
+            self._send_message_get_response(motor_id, motor_id, data, 2)
         except AssertionError:
             pass
         # check if set zero position success
-        current_state = self.set_control(id, MotorType.DM4310, 0, 0, 0, 0, 0)
+        current_state = self.set_control(motor_id, MotorType.DM4310, 0, 0, 0, 0, 0)
         diff = abs(current_state.position)
         if diff < 0.01:
             logging.info(f"motor {motor_id} set zero position success, current position: {current_state.position}")
@@ -424,10 +422,16 @@ class DMSingleMotorCanInterface(CanInterface):
             ControlMode.get_ctrl_mode_value(control_mode),
         )
 
-    def set_profile_limits(self, motor_id: int, max_velocity: float, acceleration: float) -> None:
+    def set_motor_max_speed(self, motor_id: int, max_speed: float) -> None:
+        self.write_motor_register_float(motor_id, MotorRegister.MAX_SPD, max_speed)
+
+    def set_profile_acceleration(self, motor_id: int, acceleration: float, deceleration: float) -> None:
         self.write_motor_register_float(motor_id, MotorRegister.ACC, acceleration)
-        self.write_motor_register_float(motor_id, MotorRegister.DEC, -acceleration)
-        self.write_motor_register_float(motor_id, MotorRegister.MAX_SPD, max_velocity)
+        self.write_motor_register_float(motor_id, MotorRegister.DEC, -deceleration)
+
+    def set_motion_profile(self, motor_id: int, max_speed: float, acceleration: float, deceleration: float) -> None:
+        self.set_profile_acceleration(motor_id, acceleration, deceleration)
+        self.set_motor_max_speed(motor_id, max_speed)
 
 
 @dataclass
@@ -466,8 +470,16 @@ class MotorChain(Protocol):
         """Get the runtime control mode for the chain."""
         raise NotImplementedError
 
-    def set_profile_limits(self, max_velocity: float, acceleration: float) -> None:
-        """Set onboard position profile limits for all motors in the chain."""
+    def set_motor_max_speed(self, max_speed: float) -> None:
+        """Set motor MAX_SPD for all motors in the chain."""
+        raise NotImplementedError
+
+    def set_profile_acceleration(self, acceleration: float, deceleration: float) -> None:
+        """Set onboard profile acceleration and deceleration for all motors in the chain."""
+        raise NotImplementedError
+
+    def set_motion_profile(self, max_speed: float, acceleration: float, deceleration: float) -> None:
+        """Set motor MAX_SPD plus onboard profile acceleration/deceleration for all motors."""
         raise NotImplementedError
 
     def emergency_stop(self) -> None:
@@ -523,8 +535,9 @@ class DMChainCanInterface(MotorChain):
                 use_buffered_reader=use_buffered_reader,
             )
         self.control_mode = control_mode
-        self.profile_max_velocity = 0.5
+        self.motor_max_speed = 0.5
         self.profile_acceleration = 1.0
+        self.profile_deceleration = 1.0
         # CAN bus bandwidth check with 1.1x safety factor
         CAN_FRAME_BITS = 130  # approximate bits per CAN 2.0A frame including overhead
         frames_per_cycle = len(motor_list) * 2  # send + receive per motor
@@ -809,17 +822,41 @@ class DMChainCanInterface(MotorChain):
     def get_control_mode(self) -> str:
         return self.control_mode
 
-    def set_profile_limits(self, max_velocity: float, acceleration: float) -> None:
-        if max_velocity <= 0.0:
-            raise ValueError("max_velocity must be positive")
-        if acceleration <= 0.0:
-            raise ValueError("acceleration must be positive")
+    def set_motor_max_speed(self, max_speed: float) -> None:
+        if max_speed <= 0.0:
+            raise ValueError("max_speed must be positive")
         with self.command_lock:
             for motor_id, _motor_type in self.motor_list:
-                self.motor_interface.set_profile_limits(motor_id, max_velocity, acceleration)
+                self.motor_interface.set_motor_max_speed(motor_id, max_speed)
                 time.sleep(0.003)
-            self.profile_max_velocity = max_velocity
+            self.motor_max_speed = max_speed
+
+    def set_profile_acceleration(self, acceleration: float, deceleration: float) -> None:
+        if acceleration <= 0.0:
+            raise ValueError("acceleration must be positive")
+        if deceleration <= 0.0:
+            raise ValueError("deceleration must be positive")
+        with self.command_lock:
+            for motor_id, _motor_type in self.motor_list:
+                self.motor_interface.set_profile_acceleration(motor_id, acceleration, deceleration)
+                time.sleep(0.003)
             self.profile_acceleration = acceleration
+            self.profile_deceleration = deceleration
+
+    def set_motion_profile(self, max_speed: float, acceleration: float, deceleration: float) -> None:
+        if max_speed <= 0.0:
+            raise ValueError("max_speed must be positive")
+        if acceleration <= 0.0:
+            raise ValueError("acceleration must be positive")
+        if deceleration <= 0.0:
+            raise ValueError("deceleration must be positive")
+        with self.command_lock:
+            for motor_id, _motor_type in self.motor_list:
+                self.motor_interface.set_motion_profile(motor_id, max_speed, acceleration, deceleration)
+                time.sleep(0.003)
+            self.motor_max_speed = max_speed
+            self.profile_acceleration = acceleration
+            self.profile_deceleration = deceleration
 
     def read_states(self, torques: Optional[np.ndarray] = None) -> List[MotorInfo]:
         motor_infos = []
@@ -948,9 +985,17 @@ class MultiDMChainCanInterface(MotorChain):
             raise RuntimeError(f"mixed motor control modes: {modes}")
         return modes[0]
 
-    def set_profile_limits(self, max_velocity: float, acceleration: float) -> None:
+    def set_motor_max_speed(self, max_speed: float) -> None:
         for inter in self.interfaces:
-            inter.set_profile_limits(max_velocity, acceleration)
+            inter.set_motor_max_speed(max_speed)
+
+    def set_profile_acceleration(self, acceleration: float, deceleration: float) -> None:
+        for inter in self.interfaces:
+            inter.set_profile_acceleration(acceleration, deceleration)
+
+    def set_motion_profile(self, max_speed: float, acceleration: float, deceleration: float) -> None:
+        for inter in self.interfaces:
+            inter.set_motion_profile(max_speed, acceleration, deceleration)
 
     def emergency_stop(self) -> None:
         errors: list[str] = []

@@ -64,8 +64,9 @@ def _get_gripper_only_robot(
     gripper_type: GripperType = GripperType.LINEAR_4310,
     sim: bool = False,
     control_mode: str = ControlMode.POS_VEL,
-    profile_max_velocity: float = 0.5,
+    motor_max_speed: float = 0.5,
     profile_acceleration: float = 1.0,
+    profile_deceleration: float | None = None,
 ) -> "Robot":
     """Create a gripper-only robot (no arm).
 
@@ -74,8 +75,9 @@ def _get_gripper_only_robot(
         gripper_type: Which gripper to load. Must not be NO_GRIPPER.
         sim: If True, return a SimRobot instead of connecting to real hardware.
         control_mode: Runtime motor command mode.
-        profile_max_velocity: POS_VEL maximum speed.
-        profile_acceleration: POS_VEL acceleration magnitude.
+        motor_max_speed: Motor MAX_SPD register value.
+        profile_acceleration: Onboard acceleration ramp.
+        profile_deceleration: Onboard deceleration ramp. Defaults to acceleration.
     """
     if gripper_type == GripperType.NO_GRIPPER:
         raise ValueError("gripper_type cannot be NO_GRIPPER when arm_type is NO_ARM")
@@ -132,8 +134,9 @@ def _get_gripper_only_robot(
         gripper_type=gripper_type,
         arm_type=nominal_arm,
         zero_gravity_mode=False,
-        profile_max_velocity=profile_max_velocity,
+        motor_max_speed=motor_max_speed,
         profile_acceleration=profile_acceleration,
+        profile_deceleration=profile_deceleration,
     )
     if control_mode != ControlMode.MIT:
         robot.set_motor_control_mode(control_mode)
@@ -156,8 +159,9 @@ def get_yam_robot(
     joint_state_saver_factory: Optional[Callable[[], Any]] = None,
     set_realtime_and_pin_callback: Optional[Callable[[int], None]] = None,
     control_mode: str = ControlMode.POS_VEL,
-    profile_max_velocity: float = 0.5,
+    motor_max_speed: float = 0.5,
     profile_acceleration: float = 1.0,
+    profile_deceleration: float | None = None,
 ) -> "Robot":
     """Create a YAM-family robot (real or sim).
 
@@ -175,8 +179,9 @@ def get_yam_robot(
         gripper_kd: Optional gripper kd override. Defaults to gripper_type's default.
         sim: If True, return a SimRobot instead of connecting to real hardware.
         control_mode: Runtime motor command mode. Defaults to POS_VEL, which uses onboard profiled moves.
-        profile_max_velocity: POS_VEL maximum speed in rad/s.
-        profile_acceleration: POS_VEL acceleration magnitude in rad/s^2.
+        motor_max_speed: Motor MAX_SPD register value in rad/s.
+        profile_acceleration: Onboard acceleration ramp in rad/s^2.
+        profile_deceleration: Onboard deceleration ramp in rad/s^2. Defaults to acceleration.
     """
     # --- Gripper-only path (no arm) -------------------------------------------
     if arm_type == ArmType.NO_ARM:
@@ -185,8 +190,9 @@ def get_yam_robot(
             gripper_type=gripper_type,
             sim=sim,
             control_mode=control_mode,
-            profile_max_velocity=profile_max_velocity,
+            motor_max_speed=motor_max_speed,
             profile_acceleration=profile_acceleration,
+            profile_deceleration=profile_deceleration,
         )
 
     with_gripper = gripper_type not in (GripperType.YAM_TEACHING_HANDLE, GripperType.NO_GRIPPER)
@@ -308,8 +314,9 @@ def get_yam_robot(
         clip_motor_torque=clip_motor_torque,
         joint_state_saver_factory=joint_state_saver_factory,
         set_realtime_and_pin_callback=set_realtime_and_pin_callback,
-        profile_max_velocity=profile_max_velocity,
+        motor_max_speed=motor_max_speed,
         profile_acceleration=profile_acceleration,
+        profile_deceleration=profile_deceleration,
     )
 
     if with_gripper:
