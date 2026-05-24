@@ -328,6 +328,33 @@ def test_robot_vel_mode_accepts_velocity_only_joint_state() -> None:
         robot.close()
 
 
+def test_enter_gravity_comp_idle_switches_to_mit_without_pid_target() -> None:
+    chain = FakeMotorChain()
+    robot = MotorChainRobot(
+        motor_chain=chain,
+        xml_path=None,
+        use_gravity_comp=False,
+        kp=[1.0, 1.0],
+        kd=[0.1, 0.1],
+        grav_comp_kd=[0.02, 0.03],
+        joint_limits=np.array([[-1.0, 1.0], [-1.0, 1.0]]),
+        zero_gravity_mode=False,
+    )
+
+    try:
+        chain.mode = ControlMode.POS_VEL
+        robot.enter_gravity_comp_idle()
+
+        assert chain.mode == ControlMode.MIT
+        with robot._command_lock:
+            np.testing.assert_allclose(robot._commands.pos, [0.0, 0.0])
+            np.testing.assert_allclose(robot._commands.vel, [0.0, 0.0])
+            np.testing.assert_allclose(robot._commands.kp, [0.0, 0.0])
+            np.testing.assert_allclose(robot._commands.kd, [0.02, 0.03])
+    finally:
+        robot.close()
+
+
 def test_robot_rejects_non_positive_motor_max_speed() -> None:
     chain = FakeMotorChain()
     with pytest.raises(ValueError):

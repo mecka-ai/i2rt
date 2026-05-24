@@ -732,6 +732,11 @@ class MotorChainRobot(Robot):
             self._profile_deceleration,
         )
 
+    def _set_gravity_comp_idle_commands(self) -> None:
+        with self._command_lock:
+            self._commands = JointCommands.init_all_zero(len(self.motor_chain))
+            self._commands.kd = self._grav_comp_kd.copy()
+
     def enter_gravity_comp_idle(self) -> None:
         """Reset active commands to gravity-comp idle.
 
@@ -742,9 +747,10 @@ class MotorChainRobot(Robot):
         Leaves ``self._kp`` / ``self._kd`` unchanged so subsequent control
         commands still use the configured control gains.
         """
-        with self._command_lock:
-            self._commands = JointCommands.init_all_zero(len(self.motor_chain))
-            self._commands.kd = self._grav_comp_kd.copy()
+        self._set_gravity_comp_idle_commands()
+        if self.get_motor_control_mode() != ControlMode.MIT:
+            self.motor_chain.set_control_mode(ControlMode.MIT)
+            self._set_gravity_comp_idle_commands()
 
     def start_recording(self, save_dir: str) -> bool:
         """Start recording joint state data asynchronously."""

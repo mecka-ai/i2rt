@@ -436,7 +436,6 @@ class ViserControlInterface:
             and hasattr(self._robot, "set_motion_profile")
             and not self._is_sim
         )
-
         # ---- GUI — safety gate -----------------------------------------------
         with server.gui.add_folder("Safety"):
             align_cb = server.gui.add_checkbox("Alignment Confirmed", initial_value=False)
@@ -448,10 +447,10 @@ class ViserControlInterface:
         with server.gui.add_folder("Motor Profile"):
             motor_mode_dd = server.gui.add_dropdown(
                 "Motor command",
-                options=["MIT + gravity comp", "POS-VEL profile"],
+                options=["Gravity comp idle", "MIT + gravity comp", "POS-VEL profile"],
                 initial_value="POS-VEL profile"
                 if info.get("control_mode", ControlMode.MIT) == ControlMode.POS_VEL
-                else "MIT + gravity comp",
+                else "Gravity comp idle",
             )
             torque_limit_slider = server.gui.add_slider(
                 "Torque limit (Nm)",
@@ -589,32 +588,46 @@ class ViserControlInterface:
         def _selected_motor_mode() -> str:
             return ControlMode.POS_VEL if motor_mode_dd.value == "POS-VEL profile" else ControlMode.MIT
 
+        def _gravity_idle_selected() -> bool:
+            return motor_mode_dd.value == "Gravity comp idle"
+
+        def _set_vis_mode() -> None:
+            state["mode"] = "vis"
+            mode_dd.value = "VIS (mirror)"
+            ik_ctrl.visible = False
+            for slider in joint_sliders:
+                slider.disabled = True
+            if gripper_slider is not None:
+                gripper_slider.disabled = True
+
         def _set_profile_widgets_enabled() -> None:
             supported = has_profile_control
             enabled = supported and state["enabled"]
             selected = _selected_motor_mode()
+            gravity_idle_selected = _gravity_idle_selected()
             profile_selected = selected == ControlMode.POS_VEL
             mit_selected = selected == ControlMode.MIT
+            mit_pd_selected = mit_selected and not gravity_idle_selected
             profile_enabled = enabled and profile_selected
             mit_enabled = enabled and mit_selected
             motor_mode_dd.visible = supported
             torque_limit_slider.visible = supported and mit_selected
-            gain_scale_slider.visible = supported and mit_selected
+            gain_scale_slider.visible = supported and mit_pd_selected
             motor_max_speed_slider.visible = supported and profile_selected
             profile_accel_slider.visible = supported and profile_selected
             profile_decel_slider.visible = supported and profile_selected
             motor_mode_dd.disabled = not enabled
             torque_limit_slider.disabled = not mit_enabled
-            gain_scale_slider.disabled = not mit_enabled
+            gain_scale_slider.disabled = not (enabled and mit_pd_selected)
             motor_max_speed_slider.disabled = not profile_enabled
             profile_accel_slider.disabled = not profile_enabled
             profile_decel_slider.disabled = not profile_enabled
             for slider in kp_sliders + kd_sliders:
-                slider.visible = supported and mit_selected
-                slider.disabled = not mit_enabled
+                slider.visible = supported and mit_pd_selected
+                slider.disabled = not (enabled and mit_pd_selected)
             if apply_btn is not None:
-                apply_btn.visible = supported and mit_selected
-                apply_btn.disabled = not mit_enabled
+                apply_btn.visible = supported and mit_pd_selected
+                apply_btn.disabled = not (enabled and mit_pd_selected)
 
         def _apply_motor_profile_settings() -> None:
             if not has_profile_control:
@@ -662,6 +675,8 @@ class ViserControlInterface:
             sel = mode_dd.value
             if sel == "VIS (mirror)":
                 state["mode"] = "vis"
+                if state["enabled"]:
+                    status_md.content = "**Status:** ENABLED - mirror"
                 ik_ctrl.visible = False
                 for s in joint_sliders:
                     s.disabled = True
@@ -670,6 +685,8 @@ class ViserControlInterface:
                 _set_profile_widgets_enabled()
             elif sel == "IK control":
                 state["mode"] = "ik"
+                if state["enabled"]:
+                    status_md.content = "**Status:** ENABLED - IK control"
                 ik_ctrl.visible = True
                 for s in joint_sliders:
                     s.disabled = True
@@ -686,6 +703,8 @@ class ViserControlInterface:
                 _set_profile_widgets_enabled()
             elif sel == "Joint sliders":
                 state["mode"] = "joint"
+                if state["enabled"]:
+                    status_md.content = "**Status:** ENABLED - joint sliders"
                 ik_ctrl.visible = False
                 for s in joint_sliders:
                     s.disabled = False
@@ -705,10 +724,20 @@ class ViserControlInterface:
             if not has_profile_control:
                 _set_profile_widgets_enabled()
                 return
+            if _gravity_idle_selected():
+                _set_vis_mode()
+                self._robot.enter_gravity_comp_idle()
+                status_md.content = "**Status:** ENABLED - gravity comp idle"
+                print("[viser] Entered gravity-comp idle")
+                _set_profile_widgets_enabled()
+                return
             selected = _selected_motor_mode()
             self._robot.set_motor_control_mode(selected)
             if selected != ControlMode.POS_VEL and not (state["enabled"] and state["mode"] in ("ik", "joint")):
                 self._enter_vis_grav_comp()
+                status_md.content = "**Status:** ENABLED - MIT gravity comp"
+            elif selected == ControlMode.POS_VEL:
+                status_md.content = "**Status:** ENABLED - POS-VEL profile"
             print(f"[viser] Motor command mode set to {selected}")
             _set_profile_widgets_enabled()
 
@@ -807,7 +836,7 @@ class ViserControlInterface:
                 if controlled != prev_controlled:
                     if controlled:
                         self._enter_control_grav_comp()
-                    else:
+                    elif _selected_motor_mode() != ControlMode.POS_VEL:
                         self._enter_vis_grav_comp()
                     prev_controlled = controlled
 
