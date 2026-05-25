@@ -41,6 +41,7 @@ _DEFAULT_MOTOR_MAX_SPEED = 0.5
 _MAX_MOTOR_MAX_SPEED = 12.0
 _DEFAULT_PROFILE_ACCELERATION = 1.0
 _VISUAL_SERVO_FRAME_TTL_S = 2.0
+_FRUSTUM_IMAGE_ALPHA = 204
 
 
 @dataclass(frozen=True)
@@ -237,6 +238,11 @@ class ViserControlInterface:
             return None
         return getter()
 
+    def _frustum_image(self, camera: str, *, detections: bool = False) -> np.ndarray:
+        image = self._camera_feed.latest_rgb(camera, detections=detections)
+        alpha = np.full(image.shape[:2] + (1,), _FRUSTUM_IMAGE_ALPHA, dtype=image.dtype)
+        return np.concatenate((image, alpha), axis=2)
+
     @classmethod
     def _load_camera_calibrations(
         cls,
@@ -369,11 +375,17 @@ class ViserControlInterface:
 
         # ---- Scene objects ----------------------------------------------------
         mesh_handles = self._setup_scene(server)
-        ee_frame = server.scene.add_frame("ee_frame", axes_length=0.06, axes_radius=0.004)
+        ee_frame = server.scene.add_frame(
+            "ee_frame",
+            axes_length=0.06,
+            axes_radius=0.004,
+            visible=False,
+        )
         camera_mount_frame = server.scene.add_frame(
             "camera_mount_frame",
             axes_length=0.08,
             axes_radius=0.003,
+            visible=False,
         )
         camera_sidebar_image = None
         camera_frames: Dict[str, Any] = {}
@@ -393,9 +405,9 @@ class ViserControlInterface:
                 scale=_DEFAULT_FRUSTUM_SCALE,
                 line_width=2.0,
                 color=frustum_colors.get(camera, (40, 200, 255)),
-                image=self._camera_feed.latest_rgb(camera),
-                format="jpeg",
-                jpeg_quality=70,
+                image=self._frustum_image(camera),
+                format="png",
+                visible=camera != "left",
             )
         ik_ctrl = server.scene.add_transform_controls(
             "/ik_target",
@@ -404,10 +416,10 @@ class ViserControlInterface:
             scale=0.15,
             visible=False,
         )
-        visual_servo_button_frame = server.scene.add_frame(
+        visual_servo_button_point = server.scene.add_icosphere(
             "/visual_servo/button",
-            axes_length=0.06,
-            axes_radius=0.004,
+            radius=0.008,
+            color=(255, 40, 40),
             visible=False,
         )
         visual_servo_target_frame = server.scene.add_frame(
@@ -831,7 +843,7 @@ class ViserControlInterface:
                     frustum.wxyz = self._mat3_to_wxyz(T_camera[:3, :3])
                     if frustum_scale_slider is not None:
                         frustum.scale = frustum_scale_slider.value
-                    frustum.image = self._camera_feed.latest_rgb(camera, detections=bool(detection_overlay_cb.value))
+                    frustum.image = self._frustum_image(camera, detections=bool(detection_overlay_cb.value))
                 camera_sidebar_image.image = self._camera_feed.latest_full_rgb()
 
                 now = time.time()
@@ -845,15 +857,14 @@ class ViserControlInterface:
                             button_pose = np.asarray(button_pose, dtype=float)
                             target_pose = np.asarray(target_pose, dtype=float)
                             if button_pose.shape == (4, 4) and target_pose.shape == (4, 4):
-                                visual_servo_button_frame.position = button_pose[:3, 3]
-                                visual_servo_button_frame.wxyz = self._mat3_to_wxyz(button_pose[:3, :3])
-                                visual_servo_button_frame.visible = True
+                                visual_servo_button_point.position = button_pose[:3, 3]
+                                visual_servo_button_point.visible = True
                                 visual_servo_target_frame.position = target_pose[:3, 3]
                                 visual_servo_target_frame.wxyz = self._mat3_to_wxyz(target_pose[:3, :3])
                                 visual_servo_target_frame.visible = True
                                 visual_servo_frame_expires_at = now + _VISUAL_SERVO_FRAME_TTL_S
                 if now > visual_servo_frame_expires_at:
-                    visual_servo_button_frame.visible = False
+                    visual_servo_button_point.visible = False
                     visual_servo_target_frame.visible = False
 
                 if self._with_teaching_handle:
