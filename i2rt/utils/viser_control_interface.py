@@ -40,6 +40,7 @@ _MAX_TORQUE_LIMIT_NM = 4.0
 _DEFAULT_MOTOR_MAX_SPEED = 0.5
 _MAX_MOTOR_MAX_SPEED = 12.0
 _DEFAULT_PROFILE_ACCELERATION = 1.0
+_VISUAL_SERVO_FRAME_TTL_S = 2.0
 
 
 @dataclass(frozen=True)
@@ -230,6 +231,12 @@ class ViserControlInterface:
         T[:3, :3] = site.xmat.reshape(3, 3)
         return T
 
+    def _get_visual_servo_state(self) -> Optional[Dict[str, Any]]:
+        getter = getattr(self._robot, "get_visual_servo_state", None)
+        if getter is None:
+            return None
+        return getter()
+
     @classmethod
     def _load_camera_calibrations(
         cls,
@@ -395,6 +402,18 @@ class ViserControlInterface:
             position=np.zeros(3),
             wxyz=np.array([1.0, 0.0, 0.0, 0.0]),
             scale=0.15,
+            visible=False,
+        )
+        visual_servo_button_frame = server.scene.add_frame(
+            "/visual_servo/button",
+            axes_length=0.06,
+            axes_radius=0.004,
+            visible=False,
+        )
+        visual_servo_target_frame = server.scene.add_frame(
+            "/visual_servo/standoff_target",
+            axes_length=0.045,
+            axes_radius=0.003,
             visible=False,
         )
 
@@ -784,6 +803,8 @@ class ViserControlInterface:
 
         # ---- Main loop -------------------------------------------------------
         prev_controlled = False
+        visual_servo_frame_expires_at = 0.0
+        next_visual_servo_update = 0.0
         try:
             while True:
                 self._mirror_robot()
@@ -812,6 +833,28 @@ class ViserControlInterface:
                         frustum.scale = frustum_scale_slider.value
                     frustum.image = self._camera_feed.latest_rgb(camera, detections=bool(detection_overlay_cb.value))
                 camera_sidebar_image.image = self._camera_feed.latest_full_rgb()
+
+                now = time.time()
+                if now >= next_visual_servo_update:
+                    visual_servo_state = self._get_visual_servo_state()
+                    next_visual_servo_update = now + 0.10
+                    if visual_servo_state is not None:
+                        button_pose = visual_servo_state.get("button_pose_base")
+                        target_pose = visual_servo_state.get("target_pose_base")
+                        if button_pose is not None and target_pose is not None:
+                            button_pose = np.asarray(button_pose, dtype=float)
+                            target_pose = np.asarray(target_pose, dtype=float)
+                            if button_pose.shape == (4, 4) and target_pose.shape == (4, 4):
+                                visual_servo_button_frame.position = button_pose[:3, 3]
+                                visual_servo_button_frame.wxyz = self._mat3_to_wxyz(button_pose[:3, :3])
+                                visual_servo_button_frame.visible = True
+                                visual_servo_target_frame.position = target_pose[:3, 3]
+                                visual_servo_target_frame.wxyz = self._mat3_to_wxyz(target_pose[:3, :3])
+                                visual_servo_target_frame.visible = True
+                                visual_servo_frame_expires_at = now + _VISUAL_SERVO_FRAME_TTL_S
+                if now > visual_servo_frame_expires_at:
+                    visual_servo_button_frame.visible = False
+                    visual_servo_target_frame.visible = False
 
                 if self._with_teaching_handle:
                     handle_state = self._get_teaching_handle_state()
