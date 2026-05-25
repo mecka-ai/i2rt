@@ -13,6 +13,7 @@ A PD-gains panel is shown for robots that expose kp/kd (MotorChainRobot).
 See examples/control_with_viser/ for a runnable entry-point and README.
 """
 
+import base64
 import threading
 import time
 from dataclasses import dataclass
@@ -45,6 +46,10 @@ _VISUAL_SERVO_FRAME_TTL_S = 2.0
 _FRUSTUM_IMAGE_ALPHA = 204
 _CAMERA_IMAGE_UPDATE_PERIOD_S = 0.10
 _ROBOT_STATE_STREAM_HZ = 50.0
+_PANEL_BREADCRUMB_POLL_PERIOD_S = 0.20
+_PANEL_BREADCRUMB_ALPHA = 128
+_PANEL_BREADCRUMB_POSE_MAX_AGE_S = 0.50
+_PANEL_BREADCRUMB_HISTORY_S = 8.0
 
 
 @dataclass(frozen=True)
@@ -114,7 +119,10 @@ class ViserControlInterface:
         self._robot_state_stop: Optional[threading.Event] = None
         self._robot_state_thread: Optional[threading.Thread] = None
         self._latest_robot_joint_pos = np.asarray(robot.get_joint_pos(), dtype=float)
+        self._robot_state_history: List[tuple[float, np.ndarray]] = []
         self._robot_state_error: Optional[BaseException] = None
+        self._panel_breadcrumb_keys: set[tuple[str, int, float]] = set()
+        self._panel_breadcrumb_handles: List[Any] = []
 
     @classmethod
     def from_robot(
@@ -156,6 +164,96 @@ class ViserControlInterface:
             assert self._latest_robot_joint_pos is not None
             return self._latest_robot_joint_pos.copy()
 
+    def _joint_pos_for_timestamp(self, timestamp: float) -> Optional[np.ndarray]:
+        with self._robot_state_lock:
+            if not self._robot_state_history:
+                return None
+            sample_timestamp, qpos = min(
+                self._robot_state_history,
+                key=lambda sample: abs(sample[0] - float(timestamp)),
+            )
+            if abs(sample_timestamp - float(timestamp)) > _PANEL_BREADCRUMB_POSE_MAX_AGE_S:
+                return None
+            return qpos.copy()
+
+    def _camera_pose_for_timestamp(self, camera: str, timestamp: float) -> Optional[np.ndarray]:
+        qpos = self._joint_pos_for_timestamp(timestamp)
+        if qpos is None:
+            return None
+        n = min(len(qpos), self._nq)
+        self._check_data.qpos[:n] = qpos[:n]
+        self._denormalize_slide_joints_on(self._check_data, n)
+        self._enforce_eq_constraints_on(self._check_data)
+        mujoco.mj_forward(self._model, self._check_data)
+        R_mount = self._check_data.xmat[_CAMERA_MOUNT_BODY_ID].reshape(3, 3)
+        T_mount = np.eye(4)
+        T_mount[:3, :3] = R_mount
+        T_mount[:3, 3] = (
+            self._check_data.xpos[_CAMERA_MOUNT_BODY_ID]
+            + R_mount @ _CAMERA_MOUNT_OFFSET_LOCAL
+        )
+        return T_mount @ self._camera_calibrations[camera]["T_mount_camera"]
+
+    @staticmethod
+    def _with_alpha(image: np.ndarray, alpha: int) -> np.ndarray:
+        alpha_channel = np.full(image.shape[:2] + (1,), alpha, dtype=image.dtype)
+        return np.concatenate((image, alpha_channel), axis=2)
+
+    @staticmethod
+    def _decode_jpeg_b64_rgb(encoded: str) -> np.ndarray:
+        import cv2
+
+        data = np.frombuffer(base64.b64decode(encoded), dtype=np.uint8)
+        bgr = cv2.imdecode(data, cv2.IMREAD_COLOR)
+        if bgr is None:
+            raise RuntimeError("failed to decode panel breadcrumb image")
+        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+    def _add_panel_breadcrumbs(
+        self,
+        server: Any,
+        stereo: Optional[Dict[str, Any]],
+        frustum_scale: float,
+    ) -> None:
+        if not stereo:
+            return
+        for camera, payload in stereo.items():
+            if camera not in self._camera_calibrations:
+                continue
+            if not payload.get("panel_inference_ran"):
+                continue
+            if payload.get("panel_xyxy") is None:
+                continue
+            image_b64 = payload.get("panel_snapshot_jpeg_b64")
+            if not image_b64:
+                continue
+            sequence = int(payload.get("sequence", 0))
+            frame_timestamp = float(payload["frame_timestamp"])
+            key = (str(camera), sequence, frame_timestamp)
+            if key in self._panel_breadcrumb_keys:
+                continue
+            T_camera = self._camera_pose_for_timestamp(str(camera), frame_timestamp)
+            if T_camera is None:
+                continue
+            image = self._with_alpha(
+                self._decode_jpeg_b64_rgb(str(image_b64)), _PANEL_BREADCRUMB_ALPHA
+            )
+            camera_model = self._camera_calibrations[str(camera)]["camera_model"]
+            handle = server.scene.add_camera_frustum(
+                f"panel_breadcrumbs/{camera}/{sequence}_{frame_timestamp:.3f}",
+                fov=camera_model.fov,
+                aspect=camera_model.aspect,
+                scale=frustum_scale,
+                line_width=1.5,
+                color=(255, 0, 255),
+                image=image,
+                format="png",
+            )
+            handle.position = T_camera[:3, 3]
+            handle.wxyz = self._mat3_to_wxyz(T_camera[:3, :3])
+            self._panel_breadcrumb_keys.add(key)
+            self._panel_breadcrumb_handles.append(handle)
+
     def _start_robot_state_stream(self) -> None:
         if self._robot_state_thread is not None:
             return
@@ -172,8 +270,14 @@ class ViserControlInterface:
                     pos = state.get("pos")
                     if pos is None:
                         continue
+                    timestamp = float(state.get("timestamp", time.time()))
+                    joint_pos = np.asarray(pos, dtype=float)
                     with self._robot_state_lock:
-                        self._latest_robot_joint_pos = np.asarray(pos, dtype=float)
+                        self._latest_robot_joint_pos = joint_pos
+                        self._robot_state_history.append((timestamp, joint_pos.copy()))
+                        cutoff = timestamp - _PANEL_BREADCRUMB_HISTORY_S
+                        while self._robot_state_history and self._robot_state_history[0][0] < cutoff:
+                            self._robot_state_history.pop(0)
             except Exception as exc:
                 print(f"[viser] robot state stream stopped: {exc}")
                 with self._robot_state_lock:
@@ -867,6 +971,7 @@ class ViserControlInterface:
         visual_servo_frame_expires_at = 0.0
         next_visual_servo_update = 0.0
         next_camera_image_update = 0.0
+        next_panel_breadcrumb_update = 0.0
         self._start_robot_state_stream()
         try:
             while True:
@@ -900,6 +1005,20 @@ class ViserControlInterface:
                     for camera, frustum in camera_frustums.items():
                         frustum.image = self._frustum_image(camera, detections=bool(detection_overlay_cb.value))
                     camera_sidebar_image.image = self._camera_feed.latest_full_rgb()
+
+                if now >= next_panel_breadcrumb_update:
+                    next_panel_breadcrumb_update = now + _PANEL_BREADCRUMB_POLL_PERIOD_S
+                    get_stereo = getattr(self._robot, "get_stereo_detections", None)
+                    if get_stereo is not None:
+                        try:
+                            stereo = get_stereo(
+                                include_panel_snapshots=True, active_only=True
+                            )
+                            self._add_panel_breadcrumbs(
+                                server, stereo, float(frustum_scale_slider.value)
+                            )
+                        except Exception as exc:
+                            print(f"[viser] panel breadcrumb update failed: {exc}")
 
                 if now >= next_visual_servo_update:
                     visual_servo_state = self._get_visual_servo_state()
