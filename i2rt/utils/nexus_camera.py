@@ -15,11 +15,13 @@ import yaml
 DEVICE_ID_SUBSTRING = "Atlas_Nexus2"
 DEVICE_INDEX_SUFFIX = "video-index0"
 REPO_ROOT = Path(__file__).resolve().parents[3]
-REPO_CAMERA_DATA_DIR = REPO_ROOT / "calibration" / "camera_data" / "kb4_6cam" / "per_camera_yaml"
+REPO_CAMERA_DATA_DIR = (
+    REPO_ROOT / "calibration" / "camera_data" / "kb4_6cam" / "per_camera_yaml"
+)
 REPO_HAND_EYE_DIR = REPO_ROOT / "calibration" / "camera_data" / "hand_eye"
 FRAME_SIZE = (4000, 1200)
 CAMERA_FPS = 30
-DEFAULT_DEWARP_ZOOM = 1.0
+DEFAULT_DEWARP_ZOOM = 1
 
 
 @dataclass(frozen=True)
@@ -91,7 +93,9 @@ class FisheyeCameraModel:
     ) -> "FisheyeCameraModel":
         distortion = np.asarray(distortion, dtype=float).reshape(-1)
         if distortion.size != 4:
-            raise ValueError(f"expected a 4-coefficient KB4/fisheye model, got {distortion.size}")
+            raise ValueError(
+                f"expected a 4-coefficient KB4/fisheye model, got {distortion.size}"
+            )
 
         camera_matrix = np.asarray(camera_matrix, dtype=float)
         dewarp_zoom = float(dewarp_zoom)
@@ -107,14 +111,19 @@ class FisheyeCameraModel:
 
     @property
     def fov(self) -> float:
-        return float(2.0 * np.arctan(self.image_size[1] / (2.0 * self.rectified_camera_matrix[1, 1])))
+        return float(
+            2.0
+            * np.arctan(self.image_size[1] / (2.0 * self.rectified_camera_matrix[1, 1]))
+        )
 
     @property
     def aspect(self) -> float:
         return float(self.image_size[0] / self.image_size[1])
 
     def with_dewarp_zoom(self, dewarp_zoom: float) -> "FisheyeCameraModel":
-        return self.from_intrinsics(self.camera_matrix, self.distortion, self.image_size, dewarp_zoom)
+        return self.from_intrinsics(
+            self.camera_matrix, self.distortion, self.image_size, dewarp_zoom
+        )
 
     def undistort_maps(self, cv2: Any) -> tuple[np.ndarray, np.ndarray]:
         return cv2.fisheye.initUndistortRectifyMap(
@@ -129,7 +138,9 @@ class FisheyeCameraModel:
     def undistort_points(self, points: np.ndarray) -> np.ndarray:
         import cv2
 
-        return cv2.fisheye.undistortPoints(points.astype(np.float64), self.camera_matrix, self.distortion)
+        return cv2.fisheye.undistortPoints(
+            points.astype(np.float64), self.camera_matrix, self.distortion
+        )
 
 
 def model_from_repo_camera_data(camera: str) -> FisheyeCameraModel:
@@ -150,7 +161,9 @@ def model_from_repo_camera_data(camera: str) -> FisheyeCameraModel:
         [intrinsics["k1"], intrinsics["k2"], intrinsics["k3"], intrinsics["k4"]],
         dtype=np.float64,
     )
-    return FisheyeCameraModel.from_intrinsics(camera_matrix, distortion, spec.image_size)
+    return FisheyeCameraModel.from_intrinsics(
+        camera_matrix, distortion, spec.image_size
+    )
 
 
 class NexusCamera:
@@ -193,8 +206,7 @@ class NexusCamera:
 
     def _make_undistort_maps(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
         return {
-            name: self._models[name].undistort_maps(self._cv2)
-            for name in self._cameras
+            name: self._models[name].undistort_maps(self._cv2) for name in self._cameras
         }
 
     def close(self) -> None:
@@ -216,14 +228,20 @@ class NexusCamera:
             raise RuntimeError(f"failed to read {self._device}")
         return time.time(), frame
 
-    def read_camera(self, camera: str, flush_frames: int = 1) -> tuple[float, np.ndarray]:
+    def read_camera(
+        self, camera: str, flush_frames: int = 1
+    ) -> tuple[float, np.ndarray]:
         timestamp, frame = self.read_full(flush_frames)
         image = camera_spec(camera).crop(frame)
         return timestamp, image
 
-    def read_cameras(self, flush_frames: int = 1) -> tuple[float, dict[str, np.ndarray]]:
+    def read_cameras(
+        self, flush_frames: int = 1
+    ) -> tuple[float, dict[str, np.ndarray]]:
         timestamp, frame = self.read_full(flush_frames)
-        return timestamp, {name: camera_spec(name).crop(frame) for name in self._cameras}
+        return timestamp, {
+            name: camera_spec(name).crop(frame) for name in self._cameras
+        }
 
     def latest_full_rgb(self) -> np.ndarray:
         with self._lock:
@@ -251,7 +269,9 @@ class NexusCamera:
                         "fov": self._models[name].fov,
                         "aspect": self._models[name].aspect,
                         "image_size": self._models[name].image_size,
-                        "rectified_camera_matrix": self._models[name].rectified_camera_matrix,
+                        "rectified_camera_matrix": self._models[
+                            name
+                        ].rectified_camera_matrix,
                     }
                     for name in self._cameras
                 },
@@ -282,7 +302,9 @@ class NexusCamera:
         for name in self._cameras:
             image = camera_spec(name).crop(frame)
             map1, map2 = maps[name]
-            image = self._cv2.remap(image, map1, map2, interpolation=self._cv2.INTER_LINEAR)
+            image = self._cv2.remap(
+                image, map1, map2, interpolation=self._cv2.INTER_LINEAR
+            )
             camera_images[name] = self._cv2.cvtColor(image, self._cv2.COLOR_BGR2RGB)
         with self._lock:
             self._latest_full_rgb = self._cv2.cvtColor(frame, self._cv2.COLOR_BGR2RGB)
