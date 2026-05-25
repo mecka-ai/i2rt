@@ -13,6 +13,7 @@ A PD-gains panel is shown for robots that expose kp/kd (MotorChainRobot).
 See examples/control_with_viser/ for a runnable entry-point and README.
 """
 
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -42,6 +43,8 @@ _MAX_MOTOR_MAX_SPEED = 12.0
 _DEFAULT_PROFILE_ACCELERATION = 1.0
 _VISUAL_SERVO_FRAME_TTL_S = 2.0
 _FRUSTUM_IMAGE_ALPHA = 204
+_CAMERA_IMAGE_UPDATE_PERIOD_S = 0.10
+_ROBOT_STATE_STREAM_HZ = 50.0
 
 
 @dataclass(frozen=True)
@@ -107,6 +110,11 @@ class ViserControlInterface:
 
         self._check_data = mujoco.MjData(self._model)
         self._in_collision = False
+        self._robot_state_lock = threading.Lock()
+        self._robot_state_stop: Optional[threading.Event] = None
+        self._robot_state_thread: Optional[threading.Thread] = None
+        self._latest_robot_joint_pos = np.asarray(robot.get_joint_pos(), dtype=float)
+        self._robot_state_error: Optional[BaseException] = None
 
     @classmethod
     def from_robot(
@@ -134,12 +142,53 @@ class ViserControlInterface:
 
     def _mirror_robot(self) -> None:
         """Copy robot joint positions into MuJoCo and run forward kinematics."""
-        qpos = self._robot.get_joint_pos()
+        qpos = self._robot_joint_pos()
         n = min(len(qpos), self._nq)
         self._data.qpos[:n] = qpos[:n]
         self._denormalize_slide_joints(n)
         self._enforce_eq_constraints()
         mujoco.mj_forward(self._model, self._data)
+
+    def _robot_joint_pos(self) -> np.ndarray:
+        with self._robot_state_lock:
+            if self._robot_state_error is not None:
+                raise RuntimeError("robot state stream failed") from self._robot_state_error
+            assert self._latest_robot_joint_pos is not None
+            return self._latest_robot_joint_pos.copy()
+
+    def _start_robot_state_stream(self) -> None:
+        if self._robot_state_thread is not None:
+            return
+
+        stop = threading.Event()
+        self._robot_state_stop = stop
+
+        def _run() -> None:
+            try:
+                for message in self._robot.stream_state(hz=_ROBOT_STATE_STREAM_HZ):
+                    if stop.is_set():
+                        return
+                    state = message.get("result", message)
+                    pos = state.get("pos")
+                    if pos is None:
+                        continue
+                    with self._robot_state_lock:
+                        self._latest_robot_joint_pos = np.asarray(pos, dtype=float)
+            except Exception as exc:
+                print(f"[viser] robot state stream stopped: {exc}")
+                with self._robot_state_lock:
+                    self._robot_state_error = exc
+
+        self._robot_state_thread = threading.Thread(target=_run, daemon=True)
+        self._robot_state_thread.start()
+
+    def _stop_robot_state_stream(self) -> None:
+        if self._robot_state_stop is not None:
+            self._robot_state_stop.set()
+        if self._robot_state_thread is not None:
+            self._robot_state_thread.join(timeout=1.0)
+        self._robot_state_stop = None
+        self._robot_state_thread = None
 
     def _denormalize_slide_joints(self, n_set: int) -> None:
         self._denormalize_slide_joints_on(self._data, n_set)
@@ -693,7 +742,7 @@ class ViserControlInterface:
             _set_profile_widgets_enabled()
             print("[viser] Robot ENABLED — control active")
             # Sync sliders to current robot positions on enable
-            q = self._robot.get_joint_pos()
+            q = self._robot_joint_pos()
             for i, s in enumerate(joint_sliders):
                 if i < len(q):
                     s.value = float(np.degrees(q[i]))
@@ -729,7 +778,7 @@ class ViserControlInterface:
                 ik_ctrl.wxyz = self._mat3_to_wxyz(T[:3, :3])
                 # Sync gripper slider to current position
                 if gripper_slider is not None and self._gripper_index is not None:
-                    q = self._robot.get_joint_pos()
+                    q = self._robot_joint_pos()
                     gripper_slider.value = float(q[self._gripper_index])
                 _set_profile_widgets_enabled()
             elif sel == "Joint sliders":
@@ -742,7 +791,7 @@ class ViserControlInterface:
                 if gripper_slider is not None:
                     gripper_slider.disabled = False
                 # Sync sliders to current robot positions
-                q = self._robot.get_joint_pos()
+                q = self._robot_joint_pos()
                 for i, s in enumerate(joint_sliders):
                     if i < len(q):
                         s.value = float(np.degrees(q[i]))
@@ -817,8 +866,11 @@ class ViserControlInterface:
         prev_controlled = False
         visual_servo_frame_expires_at = 0.0
         next_visual_servo_update = 0.0
+        next_camera_image_update = 0.0
+        self._start_robot_state_stream()
         try:
             while True:
+                now = time.time()
                 self._mirror_robot()
                 self._update_scene(mesh_handles)
 
@@ -843,10 +895,12 @@ class ViserControlInterface:
                     frustum.wxyz = self._mat3_to_wxyz(T_camera[:3, :3])
                     if frustum_scale_slider is not None:
                         frustum.scale = frustum_scale_slider.value
-                    frustum.image = self._frustum_image(camera, detections=bool(detection_overlay_cb.value))
-                camera_sidebar_image.image = self._camera_feed.latest_full_rgb()
+                if now >= next_camera_image_update:
+                    next_camera_image_update = now + _CAMERA_IMAGE_UPDATE_PERIOD_S
+                    for camera, frustum in camera_frustums.items():
+                        frustum.image = self._frustum_image(camera, detections=bool(detection_overlay_cb.value))
+                    camera_sidebar_image.image = self._camera_feed.latest_full_rgb()
 
-                now = time.time()
                 if now >= next_visual_servo_update:
                     visual_servo_state = self._get_visual_servo_state()
                     next_visual_servo_update = now + 0.10
@@ -896,7 +950,7 @@ class ViserControlInterface:
 
                 if not state["enabled"]:
                     # Read-only: update sliders to reflect live robot state
-                    q = self._robot.get_joint_pos()
+                    q = self._robot_joint_pos()
                     for i, s in enumerate(joint_sliders):
                         if i < len(q):
                             s.value = float(np.degrees(q[i]))
@@ -905,7 +959,7 @@ class ViserControlInterface:
 
                 elif mode == "vis":
                     # Mirror only — no commands
-                    q = self._robot.get_joint_pos()
+                    q = self._robot_joint_pos()
                     for i, s in enumerate(joint_sliders):
                         if i < len(q):
                             s.value = float(np.degrees(q[i]))
@@ -922,7 +976,7 @@ class ViserControlInterface:
                         ik_q = np.asarray(ik_result["joint_pos"], dtype=float)
                     else:
                         ik_success, ik_q = self._kin.ik(target, self._ee_site, init_q=init_q)
-                    cmd = self._robot.get_joint_pos().copy()
+                    cmd = self._robot_joint_pos().copy()
                     cmd[: self._n_arm] = ik_q[: self._n_arm]
                     if gripper_slider is not None and self._gripper_index is not None:
                         cmd[self._gripper_index] = float(gripper_slider.value)
@@ -943,7 +997,7 @@ class ViserControlInterface:
 
                 elif mode == "joint":
                     # Build command from slider values
-                    cmd = self._robot.get_joint_pos().copy()
+                    cmd = self._robot_joint_pos().copy()
                     for i, s in enumerate(joint_sliders):
                         if i < self._n_arm:
                             cmd[i] = float(np.radians(s.value))
@@ -964,6 +1018,7 @@ class ViserControlInterface:
 
         except KeyboardInterrupt:
             pass
-
-        self._camera_feed.close()
-        print("[viser] Stopped")
+        finally:
+            self._stop_robot_state_stream()
+            self._camera_feed.close()
+            print("[viser] Stopped")
