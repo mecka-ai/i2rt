@@ -587,6 +587,11 @@ class LockFreeCircularBuffer:
         self.values[idx] = value
         self.write_idx += 1
 
+    def clear(self) -> None:
+        self.timestamps.fill(0.0)
+        self.values.fill(0.0)
+        self.write_idx = 0
+
     def get_recent_values(self, time_window: float, current_time: Optional[float] = None) -> np.ndarray:
         """Get values within the specified time window."""
         if current_time is None:
@@ -613,6 +618,7 @@ class GripperForceLimiter:
         self._kp = kp
         self._past_gripper_effort_buffer = LockFreeCircularBuffer(maxsize=1000)
         self.average_torque_window = average_torque_window
+        self._last_target_qpos = None
         self.debug = debug
         (self.clog_force_threshold, self.clog_speed_threshold, self.sign, _gripper_force_torque_map) = (
             self.gripper_type.get_gripper_limiter_params(arm_type)
@@ -622,7 +628,7 @@ class GripperForceLimiter:
             gripper_force=self.max_force,
         )
 
-    def compute_target_gripper_torque(self, gripper_state: Dict[str, float]) -> float:
+    def compute_target_gripper_torque(self, gripper_state: Dict[str, float]) -> Optional[float]:
         current_speed = gripper_state["current_qvel"]
         relevant_history_effort = self._past_gripper_effort_buffer.get_recent_values(self.average_torque_window)
         if len(relevant_history_effort) > 0:
@@ -649,8 +655,17 @@ class GripperForceLimiter:
         else:
             return None
 
-    def update(self, gripper_state: Dict[str, float]) -> None:
+    def update(self, gripper_state: Dict[str, float]) -> float:
         current_ts = time.time()
+        target_qpos = float(gripper_state["target_qpos"])
+        if self._last_target_qpos is None or not np.isclose(
+            target_qpos, self._last_target_qpos, atol=1e-4
+        ):
+            self._last_target_qpos = target_qpos
+            self._is_clogged = False
+            self._gripper_adjusted_qpos = None
+            self._past_gripper_effort_buffer.clear()
+            return target_qpos
         self._past_gripper_effort_buffer.put(current_ts, gripper_state["current_eff"])
         target_eff = self.compute_target_gripper_torque(gripper_state)
 

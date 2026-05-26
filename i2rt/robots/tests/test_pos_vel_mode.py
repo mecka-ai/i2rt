@@ -10,6 +10,7 @@ from i2rt.motor_drivers import dm_driver
 from i2rt.motor_drivers.dm_driver import ControlMode, DMChainCanInterface, DMSingleMotorCanInterface, MotorRegister
 from i2rt.motor_drivers.utils import FeedbackFrameInfo, MotorInfo, MotorType
 from i2rt.robots.motor_chain_robot import MotorChainRobot
+from i2rt.robots.utils import ArmType, GripperForceLimiter, GripperType
 
 
 def _feedback() -> FeedbackFrameInfo:
@@ -219,6 +220,7 @@ def test_motor_chain_syncs_hardware_mit_mode_on_startup(monkeypatch: pytest.Monk
 class FakeMotorChain:
     def __init__(self) -> None:
         self.mode = ControlMode.MIT
+        self.mode_commands: list[str] = []
         self.motor_max_speed: float | None = None
         self.profile_acceleration: tuple[float, float] | None = None
         self.motion_profile: tuple[float, float, float] | None = None
@@ -253,6 +255,7 @@ class FakeMotorChain:
         return self.read_states()
 
     def set_control_mode(self, control_mode: str) -> None:
+        self.mode_commands.append(control_mode)
         self.mode = control_mode
 
     def get_control_mode(self) -> str:
@@ -299,6 +302,32 @@ def test_robot_pos_vel_mode_uses_profile_velocity_in_position_commands() -> None
         robot.close()
 
 
+def test_robot_set_motor_control_mode_is_idempotent() -> None:
+    chain = FakeMotorChain()
+    robot = MotorChainRobot(
+        motor_chain=chain,
+        xml_path=None,
+        use_gravity_comp=False,
+        kp=[1.0, 1.0],
+        kd=[0.1, 0.1],
+        joint_limits=np.array([[-1.0, 1.0], [-1.0, 1.0]]),
+        zero_gravity_mode=False,
+    )
+
+    try:
+        robot.set_motor_control_mode(ControlMode.POS_VEL)
+        robot.command_joint_pos(np.array([0.3, -0.4]))
+        with robot._command_lock:
+            before = robot._commands.pos.copy()
+        robot.set_motor_control_mode(ControlMode.POS_VEL)
+
+        assert chain.mode_commands == [ControlMode.POS_VEL]
+        with robot._command_lock:
+            np.testing.assert_allclose(robot._commands.pos, before)
+    finally:
+        robot.close()
+
+
 def test_robot_vel_mode_accepts_velocity_only_joint_state() -> None:
     chain = FakeMotorChain()
     robot = MotorChainRobot(
@@ -320,10 +349,44 @@ def test_robot_vel_mode_accepts_velocity_only_joint_state() -> None:
         assert chain.mode == ControlMode.VEL
         assert chain.motion_profile is None
         with robot._command_lock:
-            np.testing.assert_allclose(robot._commands.pos, [0.0, 0.0])
+            np.testing.assert_allclose(robot._commands.pos, [0.1, -0.2])
             np.testing.assert_allclose(robot._commands.vel, [0.6, -0.7])
             np.testing.assert_allclose(robot._commands.kp, [0.0, 0.0])
             np.testing.assert_allclose(robot._commands.kd, [0.0, 0.0])
+    finally:
+        robot.close()
+
+
+def test_robot_vel_mode_preserves_commanded_gripper_target() -> None:
+    chain = FakeMotorChain()
+    robot = MotorChainRobot(
+        motor_chain=chain,
+        xml_path=None,
+        use_gravity_comp=False,
+        gripper_index=1,
+        gripper_limits=np.array([-1.0, 1.0]),
+        kp=[1.0, 1.0],
+        kd=[0.1, 0.1],
+        joint_limits=np.array([[-1.0, 1.0]]),
+        zero_gravity_mode=False,
+        motor_max_speed=0.4,
+        profile_acceleration=0.8,
+    )
+
+    try:
+        robot.command_joint_pos(np.array([0.3, 0.0]))
+        robot.set_motor_control_mode(ControlMode.VEL)
+        robot.command_joint_state({"vel": np.array([0.6, 0.0])})
+
+        with robot._command_lock:
+            command_pos = robot.remapper.to_command_joint_pos_space(robot._commands.pos)
+            np.testing.assert_allclose(command_pos[1], 0.0)
+            np.testing.assert_allclose(robot._commands.vel, [0.6, 0.0])
+
+        robot.set_motor_control_mode(ControlMode.POS_VEL)
+        with robot._command_lock:
+            command_pos = robot.remapper.to_command_joint_pos_space(robot._commands.pos)
+            np.testing.assert_allclose(command_pos[1], 0.0)
     finally:
         robot.close()
 
@@ -413,3 +476,39 @@ def test_robot_motion_profile_does_not_change_pos_vel_command_speed() -> None:
         assert robot.get_robot_info()["position_command_max_velocity"] == 0.2
     finally:
         robot.close()
+
+
+def test_gripper_force_limiter_does_not_reuse_stale_clog_on_new_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = {"value": 0.0}
+    monkeypatch.setattr("i2rt.robots.utils.time.time", lambda: now["value"])
+    limiter = GripperForceLimiter(
+        max_force=50.0,
+        gripper_type=GripperType.LINEAR_4310,
+        arm_type=ArmType.YAM,
+        kp=20.0,
+        average_torque_window=0.1,
+    )
+
+    open_state = {
+        "target_qpos": 1.0,
+        "current_qpos": 1.0,
+        "current_qvel": 0.0,
+        "current_eff": 1.0,
+        "current_normalized_qpos": 1.0,
+        "target_normalized_qpos": 1.0,
+        "last_command_qpos": 1.0,
+    }
+    limiter.update(open_state)
+    now["value"] = 0.02
+    limiter.update(open_state)
+
+    close_state = {
+        **open_state,
+        "target_qpos": 0.0,
+        "target_normalized_qpos": 0.0,
+    }
+    now["value"] = 0.04
+
+    assert limiter.update(close_state) == pytest.approx(0.0)

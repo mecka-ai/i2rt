@@ -140,6 +140,7 @@ class MotorChainRobot(Robot):
                 logger.info(f"Using provided gripper limits: {gripper_limits}")
 
         self._last_gripper_command_qpos = 1  # initialize as fully open
+        self._gripper_command_pos: float | None = None
         assert clip_motor_torque >= 0.0
         if profile_deceleration is None:
             profile_deceleration = profile_acceleration
@@ -563,6 +564,8 @@ class MotorChainRobot(Robot):
         """
         pos = self._clip_robot_joint_pos_command(joint_pos)
         with self._command_lock:
+            if self._gripper_index is not None:
+                self._gripper_command_pos = float(pos[self._gripper_index])
             self._commands = JointCommands.init_all_zero(len(self.motor_chain))
             self._commands.pos = self.remapper.to_robot_joint_pos_space(pos)
             if self.get_motor_control_mode() == ControlMode.POS_VEL:
@@ -580,7 +583,9 @@ class MotorChainRobot(Robot):
         vel = joint_state["vel"]
         if self.get_motor_control_mode() == ControlMode.VEL:
             with self._command_lock:
+                pos = self._commands.pos.copy()
                 self._commands = JointCommands.init_all_zero(len(self.motor_chain))
+                self._commands.pos = pos
                 self._commands.vel = self.remapper.to_robot_joint_vel_space(vel)
             return
 
@@ -588,6 +593,8 @@ class MotorChainRobot(Robot):
         kp = joint_state.get("kp", self._kp)
         kd = joint_state.get("kd", self._kd)
         with self._command_lock:
+            if self._gripper_index is not None:
+                self._gripper_command_pos = float(pos[self._gripper_index])
             self._commands = JointCommands.init_all_zero(len(self.motor_chain))
             self._commands.pos = self.remapper.to_robot_joint_pos_space(pos)
             self._commands.vel = self.remapper.to_robot_joint_vel_space(vel)
@@ -680,10 +687,21 @@ class MotorChainRobot(Robot):
     def get_motor_control_mode(self) -> str:
         return self.motor_chain.get_control_mode()
 
+    def _joint_pos_preserving_gripper_command(self, joint_pos: np.ndarray) -> np.ndarray:
+        joint_pos = np.asarray(joint_pos, dtype=float).copy()
+        with self._command_lock:
+            gripper_command_pos = self._gripper_command_pos
+        if self._gripper_index is not None and gripper_command_pos is not None:
+            joint_pos[self._gripper_index] = gripper_command_pos
+        return joint_pos
+
     def set_motor_control_mode(self, control_mode: str) -> None:
         ControlMode.get_id_offset(control_mode)
+        if self.get_motor_control_mode() == control_mode:
+            return
         with self._state_lock:
             current_pos = self._joint_state.pos.copy()
+        current_pos = self._joint_pos_preserving_gripper_command(current_pos)
         self.command_joint_pos(current_pos)
         self.motor_chain.set_control_mode(control_mode)
         if control_mode == ControlMode.POS_VEL:

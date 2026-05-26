@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from dataclasses import dataclass
-import os
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -22,6 +22,8 @@ REPO_HAND_EYE_DIR = REPO_ROOT / "calibration" / "camera_data" / "hand_eye"
 FRAME_SIZE = (4000, 1200)
 CAMERA_FPS = 30
 DEFAULT_DEWARP_ZOOM = 1
+PANEL_DEWARP_ZOOM = 0.50
+PANEL_DEWARP_ALPHA = 0.35
 
 
 @dataclass(frozen=True)
@@ -135,12 +137,86 @@ class FisheyeCameraModel:
             cv2.CV_16SC2,
         )
 
+    def panel_camera_matrix(self) -> np.ndarray:
+        return np.array(
+            [
+                [
+                    self.camera_matrix[0, 0] * PANEL_DEWARP_ZOOM,
+                    0.0,
+                    self.image_size[0] / 2.0,
+                ],
+                [
+                    0.0,
+                    self.camera_matrix[1, 1] * PANEL_DEWARP_ZOOM,
+                    self.image_size[1] / 2.0,
+                ],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=float,
+        )
+
+    def panel_input_maps(self, cv2: Any) -> tuple[np.ndarray, np.ndarray]:
+        rect_map1, rect_map2 = cv2.fisheye.initUndistortRectifyMap(
+            self.camera_matrix,
+            self.distortion.reshape(4, 1),
+            np.eye(3),
+            self.panel_camera_matrix(),
+            self.image_size,
+            cv2.CV_32FC1,
+        )
+        width, height = self.image_size
+        grid_x, grid_y = np.meshgrid(
+            np.arange(width, dtype=np.float32),
+            np.arange(height, dtype=np.float32),
+        )
+        map1 = grid_x + PANEL_DEWARP_ALPHA * (rect_map1 - grid_x)
+        map2 = grid_y + PANEL_DEWARP_ALPHA * (rect_map2 - grid_y)
+        return map1.astype(np.float32), map2.astype(np.float32)
+
     def undistort_points(self, points: np.ndarray) -> np.ndarray:
         import cv2
 
         return cv2.fisheye.undistortPoints(
             points.astype(np.float64), self.camera_matrix, self.distortion
         )
+
+    def raw_to_rectified_pixels(self, points: np.ndarray) -> np.ndarray:
+        import cv2
+
+        points_array = np.asarray(points, dtype=np.float64).reshape(-1, 1, 2)
+        rectified = cv2.fisheye.undistortPoints(
+            points_array,
+            self.camera_matrix,
+            self.distortion.reshape(4, 1),
+            R=np.eye(3),
+            P=self.rectified_camera_matrix,
+        )
+        return rectified.reshape(-1, 2)
+
+    def panel_camera_to_raw_pixels(self, points: np.ndarray) -> np.ndarray:
+        import cv2
+
+        panel_camera_inverse = np.linalg.inv(self.panel_camera_matrix())
+        points_array = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+        homogeneous = np.column_stack(
+            [points_array, np.ones(points_array.shape[0], dtype=np.float64)]
+        )
+        rays = (panel_camera_inverse @ homogeneous.T).T
+        normalized = rays[:, :2] / rays[:, 2:3]
+        distorted = cv2.fisheye.distortPoints(
+            normalized.reshape(-1, 1, 2),
+            self.camera_matrix,
+            self.distortion.reshape(4, 1),
+        )
+        return distorted.reshape(-1, 2)
+
+    def panel_input_to_raw_pixels(self, points: np.ndarray) -> np.ndarray:
+        points_array = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+        panel_raw = self.panel_camera_to_raw_pixels(points_array)
+        return points_array + PANEL_DEWARP_ALPHA * (panel_raw - points_array)
+
+    def panel_input_to_rectified_pixels(self, points: np.ndarray) -> np.ndarray:
+        return self.raw_to_rectified_pixels(self.panel_input_to_raw_pixels(points))
 
 
 def model_from_repo_camera_data(camera: str) -> FisheyeCameraModel:
@@ -181,8 +257,10 @@ class NexusCamera:
         self._models = {name: models[name] for name in self._cameras}
         self._dewarp_zoom = float(next(iter(self._models.values())).dewarp_zoom)
         self._maps = self._make_undistort_maps()
+        self._panel_maps = self._make_panel_input_maps()
         self._cap = self._open_capture()
         self._latest_full_rgb: np.ndarray | None = None
+        self._latest_panel_rgb: dict[str, np.ndarray] = {}
         self._latest_rgb: dict[str, np.ndarray] = {}
         self._lock = threading.RLock()
         self._stop = False
@@ -207,6 +285,12 @@ class NexusCamera:
     def _make_undistort_maps(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
         return {
             name: self._models[name].undistort_maps(self._cv2) for name in self._cameras
+        }
+
+    def _make_panel_input_maps(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+        return {
+            name: self._models[name].panel_input_maps(self._cv2)
+            for name in self._cameras
         }
 
     def close(self) -> None:
@@ -252,6 +336,15 @@ class NexusCamera:
         with self._lock:
             return self._latest_rgb[camera].copy()
 
+    def latest_panel_rgb(self, camera: str) -> np.ndarray:
+        with self._lock:
+            return self._latest_panel_rgb[camera].copy()
+
+    def panel_to_rectified_pixels(self, camera: str, points: np.ndarray) -> np.ndarray:
+        with self._lock:
+            model = self._models[camera]
+        return model.panel_input_to_rectified_pixels(points)
+
     def camera_model(self, camera: str) -> FisheyeCameraModel:
         with self._lock:
             return self._models[camera]
@@ -264,6 +357,8 @@ class NexusCamera:
         with self._lock:
             return {
                 "dewarp_zoom": self._dewarp_zoom,
+                "panel_dewarp_alpha": PANEL_DEWARP_ALPHA,
+                "panel_dewarp_zoom": PANEL_DEWARP_ZOOM,
                 "models": {
                     name: {
                         "fov": self._models[name].fov,
@@ -285,6 +380,7 @@ class NexusCamera:
             }
             self._dewarp_zoom = float(dewarp_zoom)
             self._maps = self._make_undistort_maps()
+            self._panel_maps = self._make_panel_input_maps()
             return self.camera_info()
 
     def _run(self) -> None:
@@ -298,14 +394,24 @@ class NexusCamera:
     def _publish_frame(self, frame: np.ndarray) -> None:
         with self._lock:
             maps = dict(self._maps)
+            panel_maps = dict(self._panel_maps)
         camera_images = {}
+        panel_camera_images = {}
         for name in self._cameras:
-            image = camera_spec(name).crop(frame)
+            raw_image = camera_spec(name).crop(frame)
             map1, map2 = maps[name]
             image = self._cv2.remap(
-                image, map1, map2, interpolation=self._cv2.INTER_LINEAR
+                raw_image, map1, map2, interpolation=self._cv2.INTER_LINEAR
             )
             camera_images[name] = self._cv2.cvtColor(image, self._cv2.COLOR_BGR2RGB)
+            panel_map1, panel_map2 = panel_maps[name]
+            panel_image = self._cv2.remap(
+                raw_image, panel_map1, panel_map2, interpolation=self._cv2.INTER_LINEAR
+            )
+            panel_camera_images[name] = self._cv2.cvtColor(
+                panel_image, self._cv2.COLOR_BGR2RGB
+            )
         with self._lock:
             self._latest_full_rgb = self._cv2.cvtColor(frame, self._cv2.COLOR_BGR2RGB)
+            self._latest_panel_rgb = panel_camera_images
             self._latest_rgb = camera_images
