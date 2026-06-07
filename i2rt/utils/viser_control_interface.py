@@ -518,6 +518,15 @@ class ViserControlInterface:
             and hasattr(self._robot, "set_motion_profile")
             and not self._is_sim
         )
+        has_mcap_recording = all(
+            hasattr(self._robot, name)
+            for name in (
+                "start_mcap_recording",
+                "stop_mcap_recording",
+                "get_mcap_recording_status",
+                "download_mcap_recording",
+            )
+        )
         # ---- GUI — safety gate -----------------------------------------------
         with server.gui.add_folder("Safety"):
             align_cb = server.gui.add_checkbox("Alignment Confirmed", initial_value=False)
@@ -625,6 +634,18 @@ class ViserControlInterface:
                 format="jpeg",
                 jpeg_quality=70,
             )
+
+        # ---- GUI — backend MCAP recording ------------------------------------
+        record_mcap_btn: Optional[Any] = None
+        download_mcap_btn: Optional[Any] = None
+        mcap_status_md: Optional[Any] = None
+        mcap_state: Dict[str, Any] = {"active": False, "download_ready": False}
+        if has_mcap_recording:
+            with server.gui.add_folder("Recording"):
+                record_mcap_btn = server.gui.add_button("Start MCAP recording")
+                download_mcap_btn = server.gui.add_button("Download MCAP")
+                download_mcap_btn.disabled = True
+                mcap_status_md = server.gui.add_markdown("**MCAP:** idle")
 
         # ---- GUI — mode ------------------------------------------------------
         with server.gui.add_folder("Mode"):
@@ -776,6 +797,49 @@ class ViserControlInterface:
                 camera_frustums[camera].fov = camera_model.fov
                 camera_frustums[camera].aspect = camera_model.aspect
 
+        def _format_mcap_status(status: Dict[str, Any]) -> str:
+            error = status.get("error")
+            if error:
+                return f"**MCAP:** error `{error}`"
+            counts = status.get("counts") or {}
+            image_count = sum(
+                int(value) for key, value in counts.items() if str(key).startswith("image:")
+            )
+            detection_count = sum(
+                int(value)
+                for key, value in counts.items()
+                if str(key).startswith("detection_json:")
+            )
+            joint_count = int(counts.get("joint_state", 0))
+            duration = status.get("duration_s")
+            duration_text = "" if duration is None else f" {float(duration):.1f}s"
+            if status.get("active"):
+                return (
+                    f"**MCAP:** recording{duration_text} "
+                    f"({image_count} images, {detection_count} detections, {joint_count} joints)"
+                )
+            filename = status.get("filename")
+            if filename:
+                size_mb = float(status.get("size_bytes", 0)) / 1_000_000.0
+                return (
+                    f"**MCAP:** saved `{filename}` "
+                    f"({size_mb:.1f} MB, {image_count} images, {detection_count} detections)"
+                )
+            return "**MCAP:** idle"
+
+        def _sync_mcap_controls(status: Dict[str, Any]) -> None:
+            if record_mcap_btn is None or download_mcap_btn is None or mcap_status_md is None:
+                return
+            active = bool(status.get("active"))
+            ready = bool(status.get("filename")) and not active and not status.get("error")
+            mcap_state["active"] = active
+            mcap_state["download_ready"] = ready
+            record_mcap_btn.disabled = False
+            if hasattr(record_mcap_btn, "label"):
+                record_mcap_btn.label = "Stop MCAP recording" if active else "Start MCAP recording"
+            download_mcap_btn.disabled = not ready
+            mcap_status_md.content = _format_mcap_status(status)
+
         _set_profile_widgets_enabled()
 
         @align_cb.on_update
@@ -920,11 +984,59 @@ class ViserControlInterface:
         def _(_: object) -> None:
             _apply_camera_info(self._camera_feed.set_dewarp_zoom(float(dewarp_zoom_slider.value)))
 
+        if record_mcap_btn is not None:
+
+            @record_mcap_btn.on_click
+            def _(_: object) -> None:
+                assert record_mcap_btn is not None
+                assert mcap_status_md is not None
+                record_mcap_btn.disabled = True
+                try:
+                    if bool(mcap_state["active"]):
+                        mcap_status_md.content = "**MCAP:** stopping"
+                        status = self._robot.stop_mcap_recording()
+                    else:
+                        if download_mcap_btn is not None:
+                            download_mcap_btn.disabled = True
+                        mcap_status_md.content = "**MCAP:** starting"
+                        status = self._robot.start_mcap_recording()
+                    _sync_mcap_controls(status)
+                except Exception as exc:
+                    record_mcap_btn.disabled = False
+                    mcap_status_md.content = f"**MCAP:** error `{exc}`"
+
+        if download_mcap_btn is not None:
+
+            @download_mcap_btn.on_click
+            def _(event: object) -> None:
+                assert download_mcap_btn is not None
+                assert mcap_status_md is not None
+                client = getattr(event, "client", None)
+                if client is None:
+                    return
+                download_mcap_btn.disabled = True
+                try:
+                    filename, payload = self._robot.download_mcap_recording()
+                    client.send_file_download(filename, payload)
+                    notify = getattr(client, "add_notification", None)
+                    if notify is not None:
+                        notify(
+                            "MCAP ready",
+                            f"Sent {filename} ({len(payload) / 1_000_000.0:.1f} MB)",
+                            auto_close_seconds=3.0,
+                        )
+                    status = self._robot.get_mcap_recording_status()
+                    _sync_mcap_controls(status)
+                except Exception as exc:
+                    mcap_status_md.content = f"**MCAP:** download error `{exc}`"
+                    download_mcap_btn.disabled = False
+
         # ---- Main loop -------------------------------------------------------
         prev_controlled = False
         visual_servo_frame_expires_at = 0.0
         next_visual_servo_update = 0.0
         next_camera_image_update = 0.0
+        next_mcap_status_update = 0.0
         self._start_robot_state_stream()
         try:
             while True:
@@ -964,6 +1076,14 @@ class ViserControlInterface:
                     right_panel_model_sidebar_image.image = self._camera_feed.latest_panel_model_rgb(
                         "right", detections=bool(detection_overlay_cb.value)
                     )
+
+                if has_mcap_recording and now >= next_mcap_status_update:
+                    next_mcap_status_update = now + 0.5
+                    try:
+                        _sync_mcap_controls(self._robot.get_mcap_recording_status())
+                    except Exception as exc:
+                        if mcap_status_md is not None:
+                            mcap_status_md.content = f"**MCAP:** status error `{exc}`"
 
                 if now >= next_visual_servo_update:
                     visual_servo_state = self._get_visual_servo_state()
